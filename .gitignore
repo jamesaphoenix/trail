@@ -6,5 +6,12 @@
 
 # Note: .trail.toml IS meant to be committed; only the state dir above is ignored.
 
+# Python (wrappers/python)
+__pycache__/
+*.py[cod]
+
+# Node (wrappers/typescript)
+node_modules/
+
 # macOS
 .DS_Store

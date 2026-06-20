@@ -41,3 +41,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake
       - name: build + test (churn)
         run: cargo test -p trail-core --features churn --verbose
+
+  msrv:
+    name: MSRV (rust-version floor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: Swatinem/rust-cache@v2
+      - name: build + test on the declared MSRV
+        run: cargo test --workspace --verbose

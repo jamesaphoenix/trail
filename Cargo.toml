@@ -5,7 +5,13 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# CI verifies this floor with a pinned-toolchain job; bump if a dep raises it.
+rust-version = "1.82"
 license = "MIT"
+repository = "https://github.com/Just-Understanding-Data-Ltd/trail"
+homepage = "https://github.com/Just-Understanding-Data-Ltd/trail"
+keywords = ["cli", "agent", "coverage", "scheduler", "sqlite"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

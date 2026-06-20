@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Concurrency: opening a sweep now reads `current_sweep` inside the write
+  transaction and refuses while a sweep is active, so concurrent
+  `next --auto-sweep` / `sweep new` can no longer collide on the sweeps key or
+  open two overlapping active sweeps. A losing opener claims from the winner's
+  sweep instead of erroring.
+
+### Packaging
+
+- `trail-core` packages/publishes cleanly: the example config is embedded
+  (no `include_str!` escaping the crate); a test keeps the committed
+  `.trail.toml.example` identical to it.
+- `trail-cli`'s path dependency on `trail-core` carries a version; crates.io
+  metadata (repository/homepage/keywords/categories) and a declared MSRV
+  (`rust-version = 1.82`, CI-verified) added.
+- Removed accidentally-committed Python bytecode; `.gitignore` now covers
+  `__pycache__/`, `*.py[cod]`, and `node_modules/`.
+
 ## [0.1.0]
 
 Initial release.

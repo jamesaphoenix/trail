@@ -151,23 +151,6 @@ impl Store {
         Ok(())
     }
 
-    /// (strategy, seed, current_sweep) for a task, if it exists.
-    fn task_row(&self, task: &str) -> Result<Option<(Strategy, u64, i64)>> {
-        self.conn
-            .query_row(
-                "SELECT strategy, seed, current_sweep FROM tasks WHERE name = ?1",
-                params![task],
-                |r| {
-                    let s: String = r.get(0)?;
-                    let seed: i64 = r.get(1)?;
-                    let cur: i64 = r.get(2)?;
-                    Ok((Strategy::from_db(&s), seed as u64, cur))
-                },
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
     /// (sweep_no, status) of the most recent sweep for a task, if any.
     fn latest_sweep(&self, task: &str) -> Result<Option<(i64, String)>> {
         self.conn
@@ -183,16 +166,49 @@ impl Store {
     /// Open the next sweep for a task: freeze a priority score per folder from
     /// prior-sweep staleness + static weight, and seed the coverage board.
     /// Returns (sweep_no, total_folders).
+    ///
+    /// The task row (incl. `current_sweep`) is read INSIDE the write
+    /// transaction so two concurrent openers serialize: the loser sees the
+    /// winner's committed sweep and is refused with [`Error::SweepActive`]
+    /// rather than colliding on the sweeps primary key.
     fn open_sweep(&mut self, task: &str, cfg: &Config, now: i64) -> Result<(i64, i64)> {
-        let (strategy, seed, current) = self
-            .task_row(task)?
-            .ok_or_else(|| Error::Other(format!("task {task:?} does not exist")))?;
-        let new_sweep = current + 1;
         let signal = cfg.strategy.static_signal;
 
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let (strategy, seed, current) = tx
+            .query_row(
+                "SELECT strategy, seed, current_sweep FROM tasks WHERE name = ?1",
+                params![task],
+                |r| {
+                    let s: String = r.get(0)?;
+                    let seed: i64 = r.get(1)?;
+                    let cur: i64 = r.get(2)?;
+                    Ok((Strategy::from_db(&s), seed as u64, cur))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::Other(format!("task {task:?} does not exist")))?;
+
+        // Refuse if a sweep is already active (the winner of a concurrent race
+        // already opened one). Prevents two overlapping active sweeps.
+        let active: Option<i64> = tx
+            .query_row(
+                "SELECT sweep FROM sweeps WHERE task_name = ?1 AND status = 'active'
+                 ORDER BY sweep DESC LIMIT 1",
+                params![task],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(n) = active {
+            return Err(Error::SweepActive(format!(
+                "sweep {n} for task {task:?} is still active; \
+                 finish or reset it before opening a new sweep"
+            )));
+        }
+        let new_sweep = current + 1;
 
         // Folder + its most recent visit time under this task (None if never).
         let rows: Vec<(String, i64, i64, i64, Option<i64>)> = {
@@ -303,34 +319,48 @@ impl Store {
         }
 
         // Open at most one fresh sweep per call (besides bootstrap) to keep the
-        // loop bounded even if a sweep turns out empty.
+        // loop bounded even if a sweep turns out empty. `guard` is a hard
+        // backstop against any pathological transition loop.
         let mut opened = 0u8;
+        let mut guard = 0u8;
         loop {
-            let sweep = match self.latest_sweep(task)? {
-                Some((n, ref st)) if st == "active" => n,
+            guard += 1;
+            if guard > 16 {
+                return Err(Error::Other(format!(
+                    "next: too many sweep transitions for task {task:?}"
+                )));
+            }
+
+            let latest = self.latest_sweep(task)?;
+            let want_open = match &latest {
+                Some((_, st)) if st == "active" => false,
                 Some((n, _complete)) => {
                     if opened == 0 && !auto_sweep {
                         // Finished, and not asked to auto-advance: report it.
-                        return self.sweep_complete_result(task, n);
+                        return self.sweep_complete_result(task, *n);
                     }
-                    let (s, total) = self.open_sweep(task, cfg, now)?;
-                    opened += 1;
-                    if total == 0 {
-                        self.mark_sweep_complete(task, s, now)?;
-                        return self.sweep_complete_result(task, s);
-                    }
-                    s
+                    true
                 }
-                None => {
-                    // First sweep ever: always bootstrap.
-                    let (s, total) = self.open_sweep(task, cfg, now)?;
-                    opened += 1;
-                    if total == 0 {
-                        self.mark_sweep_complete(task, s, now)?;
-                        return self.sweep_complete_result(task, s);
+                None => true, // first sweep ever: bootstrap
+            };
+
+            let sweep = if want_open {
+                // On losing a concurrent open race (SweepActive), loop back and
+                // claim from the winner's now-active sweep.
+                match self.open_sweep(task, cfg, now) {
+                    Ok((s, total)) => {
+                        opened += 1;
+                        if total == 0 {
+                            self.mark_sweep_complete(task, s, now)?;
+                            return self.sweep_complete_result(task, s);
+                        }
+                        s
                     }
-                    s
+                    Err(Error::SweepActive(_)) => continue,
+                    Err(e) => return Err(e),
                 }
+            } else {
+                latest.unwrap().0
             };
 
             match self.claim(task, sweep, agent, cfg.lease.ttl_secs, now)? {
@@ -657,18 +687,11 @@ impl Store {
         }
     }
 
-    /// Explicitly open a fresh sweep (`trail sweep new`). Refuses while the
-    /// latest sweep is still active, so an in-progress sweep is never orphaned.
+    /// Explicitly open a fresh sweep (`trail sweep new`). `open_sweep` refuses
+    /// transactionally while a sweep is still active, so an in-progress sweep is
+    /// never orphaned even under concurrent callers.
     pub fn open_new_sweep(&mut self, task: &str, cfg: &Config, now: i64) -> Result<SweepInfo> {
         self.ensure_task(task, cfg.strategy.default, cfg.strategy.seed, now)?;
-        if let Some((n, st)) = self.latest_sweep(task)? {
-            if st == "active" {
-                return Err(Error::SweepActive(format!(
-                    "sweep {n} for task {task:?} is still active; \
-                     finish or reset it before opening a new sweep"
-                )));
-            }
-        }
         self.open_sweep(task, cfg, now)?;
         self.sweep_info(task)
     }
@@ -749,6 +772,34 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT count(*) FROM visits WHERE task_name = ?1",
+                params![task],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// (strategy, seed, current_sweep) for a task, if it exists, for tests.
+    fn task_row(&self, task: &str) -> Result<Option<(Strategy, u64, i64)>> {
+        self.conn
+            .query_row(
+                "SELECT strategy, seed, current_sweep FROM tasks WHERE name = ?1",
+                params![task],
+                |r| {
+                    let s: String = r.get(0)?;
+                    let seed: i64 = r.get(1)?;
+                    let cur: i64 = r.get(2)?;
+                    Ok((Strategy::from_db(&s), seed as u64, cur))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Number of active sweeps for a task (should always be 0 or 1), for tests.
+    fn active_sweep_count(&self, task: &str) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM sweeps WHERE task_name = ?1 AND status = 'active'",
                 params![task],
                 |r| r.get(0),
             )
@@ -1267,6 +1318,79 @@ mod tests {
             .unwrap();
         let (strat, _seed, _cur) = s.task_row("t").unwrap().unwrap();
         assert_eq!(strat, Strategy::Random);
+    }
+
+    #[test]
+    fn concurrent_auto_sweep_open_is_race_free() {
+        // After a drained sweep, many agents calling next(auto_sweep=true) race
+        // to open the next sweep. Exactly one opens it; the rest claim from it.
+        // No agent errors (no PK collision), and two overlapping active sweeps
+        // never exist. (Regression test for the open_sweep TOCTOU.)
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("state.db");
+        let n = 20usize;
+        let mut cfg = Config::default();
+        cfg.lease.ttl_secs = 3600;
+        {
+            let mut setup = Store::open(&db).unwrap();
+            setup.replace_folders(&folders(n), NOW).unwrap();
+            setup.open_new_sweep("t", &cfg, NOW).unwrap();
+            drain(&mut setup, "t", WorkStatus::Done, NOW); // fully drain sweep 1
+            assert_eq!(setup.status("t").unwrap().sweep_status, "complete");
+        }
+
+        let threads = 8usize;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let results = Arc::new(Mutex::new(Vec::<Result<String>>::new()));
+        let mut handles = Vec::new();
+        for tid in 0..threads {
+            let db = db.clone();
+            let cfg = cfg.clone();
+            let barrier = Arc::clone(&barrier);
+            let results = Arc::clone(&results);
+            handles.push(std::thread::spawn(move || {
+                let mut store = Store::open(&db).unwrap();
+                let agent = format!("a{tid}");
+                barrier.wait(); // maximize the open-race overlap
+                let r = store
+                    .next("t", &cfg, Some(&agent), None, true, NOW)
+                    .map(|res| match res {
+                        NextResult::Ok { path, sweep, .. } => {
+                            assert_eq!(sweep, 2, "claims must come from the one new sweep");
+                            path
+                        }
+                        _ => String::new(), // NoneAvailable / SweepComplete: no claim
+                    });
+                results.lock().unwrap().push(r);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
+        for r in &results {
+            assert!(
+                r.is_ok(),
+                "agent errored on open race: {:?}",
+                r.as_ref().err()
+            );
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            store.active_sweep_count("t"),
+            1,
+            "exactly one active sweep, never two overlapping"
+        );
+        let mut claimed: Vec<String> = results
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let before = claimed.len();
+        claimed.sort();
+        claimed.dedup();
+        assert_eq!(claimed.len(), before, "a folder was leased to two agents");
     }
 
     proptest::proptest! {

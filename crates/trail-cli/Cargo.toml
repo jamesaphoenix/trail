@@ -2,7 +2,12 @@
 name = "trail-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "CLI for trail: hands agents the next folder to cover, per task-name."
 
 [[bin]]
@@ -10,7 +15,8 @@ name = "trail"
 path = "src/main.rs"
 
 [dependencies]
-trail-core = { path = "../trail-core" }
+# version is required (alongside path) so `cargo publish` accepts the dep.
+trail-core = { path = "../trail-core", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

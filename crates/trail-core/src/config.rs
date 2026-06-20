@@ -125,7 +125,44 @@ impl Config {
 }
 
 /// The contents written by `trail init` when no example config exists.
-pub const EXAMPLE_CONFIG: &str = include_str!("../../../.trail.toml.example");
+///
+/// Inlined (not `include_str!` of the workspace-root file) so `trail-core`
+/// packages/publishes cleanly: `cargo package` only bundles crate-local files,
+/// and a `../../../` path would escape the crate. The committed
+/// `.trail.toml.example` at the workspace root is kept identical to this and a
+/// test enforces that (see `example_file_matches_embedded_default`).
+pub const EXAMPLE_CONFIG: &str = r#"# trail config. Commit this file; the state DB under .trail/ is gitignored.
+# Copy to `.trail.toml` and edit. `trail init` writes this example if absent.
+
+[scan]
+# Extra glob patterns layered on top of the ignore-crate defaults.
+# .gitignore and sane language defaults (target, node_modules, .git, dist,
+# __pycache__, .venv, etc.) are already excluded for free.
+include = ["**/*"]
+exclude = ["**/migrations/**"]
+# Respect .gitignore / .ignore files while walking.
+respect_gitignore = true
+# Skip folders that directly contain fewer than this many files.
+min_files = 1
+
+[strategy]
+# round-robin | weighted | random
+default = "weighted"
+# Seed for the `random` strategy (reproducible orderings).
+seed = 42
+# weighted: blend of recency (staleness) vs static weight. 1.0 = pure recency.
+alpha = 0.6
+# Recency decay half-life in seconds (default 7 days). A folder visited one
+# half-life ago has ~half the recency priority of a never-visited folder.
+half_life_secs = 604800
+# Static signal used as folder weight: file_count | size_bytes | churn
+static_signal = "file_count"
+
+[lease]
+# How long a claimed folder stays leased before it is reclaimed for another
+# agent (covers crashed/stalled agents). Default 15 minutes.
+ttl_secs = 900
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -206,6 +243,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = Config::load(dir.path()).unwrap();
         assert_eq!(c.strategy.default, Strategy::Weighted);
+    }
+
+    #[test]
+    fn example_file_matches_embedded_default() {
+        // The committed workspace .trail.toml.example must stay identical to the
+        // embedded EXAMPLE_CONFIG so docs and `trail init` output never drift.
+        // Read at test time via the manifest dir (not include_str!, which would
+        // re-introduce the publish-breaking path escape).
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.trail.toml.example");
+        let on_disk = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert_eq!(
+            on_disk,
+            EXAMPLE_CONFIG,
+            "{} drifted from EXAMPLE_CONFIG",
+            path.display()
+        );
     }
 
     #[test]

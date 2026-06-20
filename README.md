@@ -78,8 +78,8 @@ and hidden dirs are excluded for free; config only layers extra globs. See
 - Python: [`wrappers/python`](wrappers/python)
 - TypeScript / Node: [`wrappers/typescript`](wrappers/typescript)
 
-Both are ~50 lines that shell out to the binary and parse JSON. The shell-out +
-JSON + exit-code contract makes a wrapper in any language trivial.
+Both are thin wrappers that shell out to the binary and parse JSON. The
+shell-out + JSON + exit-code contract makes a wrapper in any language trivial.
 
 ## Layout
 
