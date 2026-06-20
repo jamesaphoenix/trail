@@ -50,6 +50,15 @@ cargo build --release --features churn
 The language wrappers locate the binary via `PATH`, or via the `TRAIL_BIN`
 environment variable (e.g. `TRAIL_BIN=/path/to/trail`).
 
+Tagged releases (`v*`) build prebuilt binaries for Linux, macOS (Intel + Apple
+Silicon), and Windows via GitHub Actions.
+
+Shell completions:
+
+```bash
+trail completions zsh  > ~/.zfunc/_trail      # or bash / fish / powershell / elvish
+```
+
 ## Use
 
 ```bash

@@ -219,6 +219,23 @@ fn rescan_new_sweep_picks_up_added_folder() {
 }
 
 #[test]
+fn completions_generate_for_each_shell() {
+    // Completions must work with no repo/config present.
+    let dir = tempfile::tempdir().unwrap();
+    for (shell, needle) in [
+        ("bash", "_trail"),
+        ("zsh", "#compdef trail"),
+        ("fish", "complete -c trail"),
+    ] {
+        trail(dir.path())
+            .args(["completions", shell])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains(needle));
+    }
+}
+
+#[test]
 fn sweep_new_while_active_errors() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

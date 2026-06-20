@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `trail completions <shell>` prints a shell completion script (bash, zsh, fish,
+  powershell, elvish) and works with no repo/config present.
+- Release workflow: tagged versions (`v*`) build prebuilt binaries for Linux,
+  macOS (x86_64 + aarch64), and Windows and attach them to a GitHub release.
+
 ### Fixed
 
 - Concurrency: opening a sweep now reads `current_sweep` inside the write

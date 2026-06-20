@@ -8,7 +8,8 @@
 //!   3  sweep-complete  (the loop should stop, or open a new sweep)
 //!   4  none-available  (folders are leased elsewhere; wait briefly and retry)
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -103,6 +104,11 @@ enum Cmd {
         #[arg(long)]
         vacuum: bool,
     },
+    /// Print a shell completion script to stdout, e.g. `trail completions zsh`.
+    Completions {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -171,6 +177,12 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> trail_core::Result<u8> {
+    // Completions need neither a config nor a repo, so handle before loading.
+    if let Cmd::Completions { shell } = &cli.cmd {
+        clap_complete::generate(*shell, &mut Cli::command(), "trail", &mut std::io::stdout());
+        return Ok(EXIT_OK);
+    }
+
     let root = cli
         .root
         .clone()
@@ -275,6 +287,7 @@ fn run(cli: Cli) -> trail_core::Result<u8> {
             emit(&store.gc(now, vacuum)?);
             Ok(EXIT_OK)
         }
+        Cmd::Completions { .. } => unreachable!("handled before config load"),
     }
 }
 
