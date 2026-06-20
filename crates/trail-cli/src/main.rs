@@ -179,7 +179,15 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> trail_core::Result<u8> {
     // Completions need neither a config nor a repo, so handle before loading.
     if let Cmd::Completions { shell } = &cli.cmd {
-        clap_complete::generate(*shell, &mut Cli::command(), "trail", &mut std::io::stdout());
+        // Generate into a buffer, then write via the same EPIPE-tolerant path as
+        // emit(): clap_complete::generate() panics (.expect) on a write error, so
+        // writing it to stdout directly would crash on `... | head` / `... | true`.
+        use std::io::Write;
+        let mut buf = Vec::new();
+        clap_complete::generate(*shell, &mut Cli::command(), "trail", &mut buf);
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&buf);
+        let _ = out.flush();
         return Ok(EXIT_OK);
     }
 

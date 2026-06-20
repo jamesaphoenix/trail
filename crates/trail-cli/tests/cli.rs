@@ -236,6 +236,30 @@ fn completions_generate_for_each_shell() {
 }
 
 #[test]
+fn completions_survive_a_closed_pipe() {
+    // Mirrors `trail completions bash | true`: close the read end before the
+    // child writes, so the write hits EPIPE. Must not panic (exit 101).
+    use std::process::{Command, Stdio};
+    let bin = assert_cmd::cargo::cargo_bin("trail");
+    let mut child = Command::new(bin)
+        .args(["completions", "bash"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Drop the read end immediately without reading any of it.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "completions panicked on a closed pipe: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "expected clean exit on closed pipe");
+}
+
+#[test]
 fn sweep_new_while_active_errors() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
