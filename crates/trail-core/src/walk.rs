@@ -100,6 +100,21 @@ fn build_overrides(root: &Path, cfg: &Config) -> Result<ignore::overrides::Overr
         .map_err(|e| Error::Walk(format!("override build: {e}")))
 }
 
+/// Normalize a user-supplied folder path so it matches the stored form:
+/// forward slashes, no leading `./`, no trailing slash, and the empty string
+/// (or `.`) maps to ".". This lets `done`/`skip` accept native or
+/// backslash paths and still match what `init` recorded.
+pub fn normalize_rel(path: &str) -> String {
+    let s = path.replace('\\', "/");
+    let s = s.strip_prefix("./").unwrap_or(&s);
+    let s = s.trim_end_matches('/');
+    if s.is_empty() {
+        ".".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 /// `p` relative to `root`, using forward slashes; the root itself is ".".
 fn rel_path(root: &Path, p: &Path) -> String {
     match p.strip_prefix(root) {

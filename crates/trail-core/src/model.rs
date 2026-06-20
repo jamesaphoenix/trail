@@ -152,6 +152,12 @@ pub enum NextResult {
         sweep: i64,
         /// Folders covered (done) in the completed sweep.
         covered: i64,
+        /// Total folders in the sweep. `total == 0` means nothing was
+        /// registered (likely a missing `trail init`), not real completion.
+        total: i64,
+        /// Present only when something looks off (e.g. an empty sweep).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
 }
 

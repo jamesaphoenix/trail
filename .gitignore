@@ -4,8 +4,7 @@
 # trail runtime state (the SQLite DB lives here; never commit it)
 .trail/
 
-# Local config generated from the example
-.trail.toml
+# Note: .trail.toml IS meant to be committed; only the state dir above is ignored.
 
 # macOS
 .DS_Store

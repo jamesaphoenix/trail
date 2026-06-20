@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS visits (
   sweep      INTEGER NOT NULL,
   visited_at INTEGER NOT NULL,
   agent_id   TEXT,
-  status     TEXT NOT NULL
+  status     TEXT NOT NULL,
+  reason     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_visits_recency ON visits (task_name, path, visited_at);
 "#;
@@ -97,6 +98,10 @@ impl Store {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
         conn.execute_batch(SCHEMA)?;
+        // Idempotent migration for DBs created before `visits.reason` existed.
+        // CREATE TABLE IF NOT EXISTS will not add a column to an existing table,
+        // so add it explicitly and ignore the duplicate-column error on fresh DBs.
+        let _ = conn.execute("ALTER TABLE visits ADD COLUMN reason TEXT", []);
         Ok(Store { conn })
     }
 
@@ -104,7 +109,9 @@ impl Store {
 
     /// Replace the entire folder snapshot (called by `init` / rescan).
     pub fn replace_folders(&mut self, folders: &[FolderStat], now: i64) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM folders", [])?;
         {
             let mut ins = tx.prepare(
@@ -253,15 +260,26 @@ impl Store {
     }
 
     fn sweep_complete_result(&self, task: &str, sweep: i64) -> Result<NextResult> {
-        let covered: i64 = self.conn.query_row(
-            "SELECT count(*) FROM work_items WHERE task_name = ?1 AND sweep = ?2 AND status = 'done'",
+        let (covered, total): (i64, i64) = self.conn.query_row(
+            "SELECT coalesce(sum(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0),
+                    count(*)
+             FROM work_items WHERE task_name = ?1 AND sweep = ?2",
             params![task, sweep],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
+        // A zero-folder sweep is almost always a missing `init` or an exclude
+        // that matched everything, not real completion. Flag it.
+        let note = if total == 0 {
+            Some("no folders registered for this sweep - did you run `trail init`?".to_string())
+        } else {
+            None
+        };
         Ok(NextResult::SweepComplete {
             task: task.to_string(),
             sweep,
             covered,
+            total,
+            note,
         })
     }
 
@@ -371,6 +389,9 @@ impl Store {
             params![task, sweep, now],
         )?;
 
+        // Saturate rather than overflow-panic (debug) or wrap negative (release,
+        // which would make the lease look already expired).
+        let expires = now.checked_add(ttl).unwrap_or(i64::MAX);
         let claimed: Option<(String, f64, i64)> = tx
             .query_row(
                 "UPDATE work_items
@@ -381,7 +402,7 @@ impl Store {
                        ORDER BY score DESC, path ASC
                        LIMIT 1)
                 RETURNING path, score, lease_expires_at",
-                params![task, sweep, agent, now + ttl],
+                params![task, sweep, agent, expires],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
@@ -421,37 +442,75 @@ impl Store {
 
     // --- completion --------------------------------------------------------
 
-    /// Mark a folder done/skipped in the latest sweep and append to history.
+    /// Mark a folder done/skipped and append it to the task's history.
+    ///
+    /// The path is normalized to the stored form, then resolved to the sweep
+    /// where it is actually outstanding (preferring the sweep this `agent`
+    /// leased it in), rather than blindly the newest sweep. Re-completing an
+    /// already-terminal folder is idempotent. A path that is not a work item in
+    /// any sweep is an error, so a typo or a missed `init` is not silently
+    /// reported as success.
     pub fn complete(
         &mut self,
         task: &str,
         path: &str,
         agent: Option<&str>,
         status: WorkStatus,
+        reason: Option<&str>,
         now: i64,
     ) -> Result<CompleteResult> {
-        let (sweep, _st) = self
-            .latest_sweep(task)?
-            .ok_or_else(|| Error::Other(format!("no sweep open for task {task:?}")))?;
+        let path = crate::walk::normalize_rel(path);
         let st = status.as_str();
 
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let updated = tx.execute(
-            "UPDATE work_items
-                SET status = ?4, visited_at = ?5, lease_owner = NULL, lease_expires_at = NULL
-              WHERE task_name = ?1 AND sweep = ?2 AND path = ?3
-                AND status NOT IN ('done', 'skipped')",
-            params![task, sweep, path, st, now],
-        )?;
-        if updated > 0 {
+
+        // Pick the most relevant row for this path: an outstanding one first
+        // (preferring this agent's lease), else the newest terminal one so a
+        // re-completion is idempotent. None at all = a genuine miss.
+        let target: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT sweep, status FROM work_items
+                  WHERE task_name = ?1 AND path = ?2
+                  ORDER BY (status IN ('pending', 'leased')) DESC,
+                           coalesce(lease_owner = ?3, 0) DESC,
+                           sweep DESC
+                  LIMIT 1",
+                params![task, path, agent],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        let (sweep, cur_status) = match target {
+            Some(t) => t,
+            None => {
+                return Err(Error::NotInSweep(format!(
+                    "path {path:?} is not a work item in any sweep of task {task:?} \
+                     (typo, wrong --task, or excluded by config?)"
+                )));
+            }
+        };
+
+        let already_terminal = cur_status == "done" || cur_status == "skipped";
+        let result_status = if already_terminal {
+            cur_status
+        } else {
             tx.execute(
-                "INSERT INTO visits (task_name, path, sweep, visited_at, agent_id, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![task, path, sweep, now, agent, st],
+                "UPDATE work_items
+                    SET status = ?4, visited_at = ?5, lease_owner = NULL, lease_expires_at = NULL
+                  WHERE task_name = ?1 AND sweep = ?2 AND path = ?3
+                    AND status NOT IN ('done', 'skipped')",
+                params![task, sweep, path, st, now],
             )?;
-        }
+            tx.execute(
+                "INSERT INTO visits (task_name, path, sweep, visited_at, agent_id, status, reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![task, path, sweep, now, agent, st, reason],
+            )?;
+            st.to_string()
+        };
+
         let remaining: i64 = tx.query_row(
             "SELECT count(*) FROM work_items
               WHERE task_name = ?1 AND sweep = ?2 AND status IN ('pending', 'leased')",
@@ -469,10 +528,10 @@ impl Store {
         tx.commit()?;
 
         Ok(CompleteResult {
-            status: st.to_string(),
+            status: result_status,
             task: task.to_string(),
             sweep,
-            path: path.to_string(),
+            path,
             remaining,
             sweep_complete,
         })
@@ -598,15 +657,26 @@ impl Store {
         }
     }
 
-    /// Explicitly open a fresh sweep (`trail sweep new`).
+    /// Explicitly open a fresh sweep (`trail sweep new`). Refuses while the
+    /// latest sweep is still active, so an in-progress sweep is never orphaned.
     pub fn open_new_sweep(&mut self, task: &str, cfg: &Config, now: i64) -> Result<SweepInfo> {
         self.ensure_task(task, cfg.strategy.default, cfg.strategy.seed, now)?;
+        if let Some((n, st)) = self.latest_sweep(task)? {
+            if st == "active" {
+                return Err(Error::SweepActive(format!(
+                    "sweep {n} for task {task:?} is still active; \
+                     finish or reset it before opening a new sweep"
+                )));
+            }
+        }
         self.open_sweep(task, cfg, now)?;
         self.sweep_info(task)
     }
 
     pub fn reset(&mut self, task: &str, all: bool) -> Result<ResetResult> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let cleared_sweeps: i64 = tx.query_row(
             "SELECT count(*) FROM sweeps WHERE task_name = ?1",
             params![task],
@@ -629,8 +699,11 @@ impl Store {
         })
     }
 
-    /// Reclaim expired leases across all sweeps and compact the DB.
-    pub fn gc(&mut self, now: i64) -> Result<GcResult> {
+    /// Reclaim expired leases across all sweeps. Reclaiming is the always-safe
+    /// primary action; `VACUUM` (only when `vacuum` is set) can return
+    /// SQLITE_BUSY under concurrent connections, so a failure there is logged
+    /// rather than failing the whole command.
+    pub fn gc(&mut self, now: i64, vacuum: bool) -> Result<GcResult> {
         let reclaimed = {
             let tx = self
                 .conn
@@ -644,10 +717,31 @@ impl Store {
             tx.commit()?;
             n as i64
         };
-        self.conn.execute_batch("VACUUM;")?;
+        if vacuum {
+            if let Err(e) = self.conn.execute_batch("VACUUM;") {
+                log::warn!("trail gc: VACUUM skipped ({e})");
+            }
+        }
         Ok(GcResult {
             reclaimed_leases: reclaimed,
         })
+    }
+}
+
+#[cfg(test)]
+impl Store {
+    /// Latest recorded visit reason for a (task, path), for tests.
+    fn last_visit_reason(&self, task: &str, path: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT reason FROM visits WHERE task_name = ?1 AND path = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![task, path],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten()
     }
 }
 
@@ -692,7 +786,7 @@ mod tests {
                 NextResult::Ok { path, .. } => {
                     claimed.push(path.clone());
                     let r = s
-                        .complete("t", &path, Some("a1"), WorkStatus::Done, NOW)
+                        .complete("t", &path, Some("a1"), WorkStatus::Done, None, NOW)
                         .unwrap();
                     assert_eq!(r.status, "done");
                 }
@@ -743,7 +837,8 @@ mod tests {
         for (p, t) in [("a", 100), ("b", 200), ("c", 300)] {
             // claim something then complete the specific path at time t
             let _ = s.next("t", &cfg, Some("x"), None, false, t).unwrap();
-            s.complete("t", p, Some("x"), WorkStatus::Done, t).unwrap();
+            s.complete("t", p, Some("x"), WorkStatus::Done, None, t)
+                .unwrap();
         }
 
         // Sweep 2 at t=1000: stalest first => a (visited at 100) before c (300).
@@ -764,7 +859,7 @@ mod tests {
         loop {
             match s.next("t", &cfg, Some("a"), None, false, NOW).unwrap() {
                 NextResult::Ok { path, .. } => {
-                    s.complete("t", &path, Some("a"), WorkStatus::Done, NOW)
+                    s.complete("t", &path, Some("a"), WorkStatus::Done, None, NOW)
                         .unwrap();
                 }
                 NextResult::SweepComplete { sweep, .. } => {
@@ -844,7 +939,7 @@ mod tests {
                         NextResult::Ok { path, .. } => {
                             claimed.lock().unwrap().push(path.clone());
                             store
-                                .complete("t", &path, Some(&agent), WorkStatus::Done, NOW)
+                                .complete("t", &path, Some(&agent), WorkStatus::Done, None, NOW)
                                 .unwrap();
                         }
                         NextResult::SweepComplete { .. } => break,
@@ -868,5 +963,141 @@ mod tests {
         };
         assert_eq!(dupes, 0, "no folder claimed twice");
         assert_eq!(got.len(), n, "every folder covered exactly once");
+    }
+
+    #[test]
+    fn complete_unknown_path_errors_and_recompletion_is_idempotent() {
+        let (mut s, cfg) = seeded(2);
+        let path = match s.next("t", &cfg, Some("a1"), None, false, NOW).unwrap() {
+            NextResult::Ok { path, .. } => path,
+            other => panic!("expected ok, got {other:?}"),
+        };
+        s.complete("t", &path, Some("a1"), WorkStatus::Done, None, NOW)
+            .unwrap();
+
+        // A bogus path is a real miss, not silent success.
+        assert!(matches!(
+            s.complete(
+                "t",
+                "does/not/exist",
+                Some("a1"),
+                WorkStatus::Done,
+                None,
+                NOW
+            ),
+            Err(Error::NotInSweep(_))
+        ));
+
+        // Re-completing the same real path stays Ok and reports done.
+        let again = s
+            .complete("t", &path, Some("a1"), WorkStatus::Done, None, NOW)
+            .unwrap();
+        assert_eq!(again.status, "done");
+
+        // Neither the miss nor the idempotent redo advanced coverage past 1.
+        let st = s.status("t").unwrap();
+        assert_eq!(st.done, 1);
+        assert_eq!(st.skipped, 0);
+    }
+
+    #[test]
+    fn complete_normalizes_slashes_and_dot_prefix() {
+        let mut s = Store::open_in_memory().unwrap();
+        let cfg = Config::default();
+        s.replace_folders(
+            &[FolderStat {
+                path: "src/api".into(),
+                file_count: 1,
+                size_bytes: 1,
+                churn: 0,
+            }],
+            NOW,
+        )
+        .unwrap();
+        s.next("t", &cfg, Some("a1"), None, false, NOW).unwrap();
+        // A ./ prefix and backslashes still match the stored "src/api".
+        let r = s
+            .complete("t", ".\\src\\api", Some("a1"), WorkStatus::Done, None, NOW)
+            .unwrap();
+        assert_eq!(r.path, "src/api");
+        assert_eq!(r.status, "done");
+        assert!(r.sweep_complete);
+    }
+
+    #[test]
+    fn sweep_new_refused_while_active() {
+        let (mut s, cfg) = seeded(2);
+        // Bootstrap sweep 1 and leave it active.
+        s.next("t", &cfg, Some("a1"), None, false, NOW).unwrap();
+        assert!(matches!(
+            s.open_new_sweep("t", &cfg, NOW),
+            Err(Error::SweepActive(_))
+        ));
+        // Drain it, then a new sweep is allowed.
+        for p in ["dir000", "dir001"] {
+            let _ = s.complete("t", p, Some("a1"), WorkStatus::Done, None, NOW);
+        }
+        let info = s.open_new_sweep("t", &cfg, NOW).unwrap();
+        assert_eq!(info.sweep, 2);
+    }
+
+    #[test]
+    fn huge_ttl_does_not_overflow_or_self_reclaim() {
+        let (mut s, mut cfg) = seeded(1);
+        cfg.lease.ttl_secs = i64::MAX;
+        match s.next("t", &cfg, Some("a1"), None, false, NOW).unwrap() {
+            NextResult::Ok {
+                lease_expires_at, ..
+            } => assert_eq!(lease_expires_at, i64::MAX),
+            other => panic!("expected ok, got {other:?}"),
+        }
+        // The lease is not spuriously reclaimed by overflow wrap.
+        assert!(matches!(
+            s.next("t", &cfg, Some("a2"), None, false, NOW + 5).unwrap(),
+            NextResult::NoneAvailable { .. }
+        ));
+    }
+
+    #[test]
+    fn skip_reason_is_stored() {
+        let (mut s, cfg) = seeded(1);
+        let path = match s.next("t", &cfg, Some("a1"), None, false, NOW).unwrap() {
+            NextResult::Ok { path, .. } => path,
+            other => panic!("expected ok, got {other:?}"),
+        };
+        let r = s
+            .complete(
+                "t",
+                &path,
+                Some("a1"),
+                WorkStatus::Skipped,
+                Some("flaky build"),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(r.status, "skipped");
+        assert_eq!(
+            s.last_visit_reason("t", &path).as_deref(),
+            Some("flaky build")
+        );
+    }
+
+    #[test]
+    fn empty_sweep_reports_total_zero_with_note() {
+        let mut s = Store::open_in_memory().unwrap();
+        let cfg = Config::default();
+        match s.next("t", &cfg, None, None, false, NOW).unwrap() {
+            NextResult::SweepComplete {
+                covered,
+                total,
+                note,
+                ..
+            } => {
+                assert_eq!(covered, 0);
+                assert_eq!(total, 0);
+                assert!(note.is_some(), "empty sweep should carry a note");
+            }
+            other => panic!("expected sweep-complete, got {other:?}"),
+        }
     }
 }

@@ -79,15 +79,42 @@ impl Default for LeaseConfig {
 
 impl Config {
     /// Load `<dir>/.trail.toml`, or return defaults if the file is absent.
+    /// The result is always validated, so callers get a clear error rather
+    /// than silently-broken scheduling from a bad value.
     pub fn load(dir: &Path) -> Result<Config> {
         let path = dir.join(".trail.toml");
-        if !path.exists() {
-            return Ok(Config::default());
-        }
-        let text = std::fs::read_to_string(&path)?;
-        let cfg: Config =
-            toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+        let cfg: Config = if !path.exists() {
+            Config::default()
+        } else {
+            let text = std::fs::read_to_string(&path)?;
+            toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?
+        };
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Reject semantically invalid settings. A non-positive lease TTL is the
+    /// dangerous one: it would make every freshly leased folder look already
+    /// expired, so two agents could claim the same folder.
+    pub fn validate(&self) -> Result<()> {
+        if self.lease.ttl_secs <= 0 {
+            return Err(Error::Config(format!(
+                "lease.ttl_secs must be > 0 (got {})",
+                self.lease.ttl_secs
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.strategy.alpha) {
+            return Err(Error::Config(format!(
+                "strategy.alpha must be between 0.0 and 1.0 (got {})",
+                self.strategy.alpha
+            )));
+        }
+        if self.strategy.half_life_secs < 1 {
+            return Err(Error::Config(
+                "strategy.half_life_secs must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// True when the include list is the universal catch-all (no real
@@ -135,5 +162,31 @@ mod tests {
         let c: Config = toml::from_str(EXAMPLE_CONFIG).unwrap();
         assert_eq!(c.strategy.static_signal, StaticSignal::FileCount);
         assert_eq!(c.scan.exclude, vec!["**/migrations/**".to_string()]);
+    }
+
+    #[test]
+    fn defaults_validate() {
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bad_values() {
+        let bad_ttl = |secs: i64| {
+            let mut c = Config::default();
+            c.lease.ttl_secs = secs;
+            c
+        };
+        assert!(matches!(bad_ttl(0).validate(), Err(Error::Config(_))));
+        assert!(matches!(bad_ttl(-100).validate(), Err(Error::Config(_))));
+
+        let mut a = Config::default();
+        a.strategy.alpha = 2.5;
+        assert!(matches!(a.validate(), Err(Error::Config(_))));
+        a.strategy.alpha = -1.0;
+        assert!(matches!(a.validate(), Err(Error::Config(_))));
+
+        let mut hl = Config::default();
+        hl.strategy.half_life_secs = 0;
+        assert!(matches!(hl.validate(), Err(Error::Config(_))));
     }
 }

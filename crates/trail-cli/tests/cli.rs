@@ -117,3 +117,66 @@ fn none_available_when_all_leased() {
         .stdout(predicates::str::contains("\"status\":\"none-available\""))
         .stdout(predicates::str::contains("\"leased_outstanding\":1"));
 }
+
+#[test]
+fn done_with_unknown_path_exits_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "real/x.rs", "fn x() {}");
+    trail(root).arg("init").assert().success();
+    trail(root).args(["next", "--task", "t"]).assert().success();
+
+    // A typo / wrong path is a hard error (exit 1), not silent success.
+    trail(root)
+        .args(["done", "--task", "t", "--path", "bogus/typo"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("not a work item"));
+
+    // Coverage did not advance.
+    trail(root)
+        .args(["status", "--task", "t"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"done\":0"));
+}
+
+#[test]
+fn empty_repo_next_flags_missing_init() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // No init, no files: completion must be distinguishable from real coverage.
+    trail(root)
+        .args(["next", "--task", "t"])
+        .assert()
+        .code(3)
+        .stdout(predicates::str::contains("\"total\":0"))
+        .stdout(predicates::str::contains("\"note\""));
+}
+
+#[test]
+fn gc_runs_and_vacuum_flag_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a/a.rs", "fn a() {}");
+    trail(root).arg("init").assert().success();
+    trail(root)
+        .arg("gc")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"reclaimed_leases\""));
+    trail(root).args(["gc", "--vacuum"]).assert().success();
+}
+
+#[test]
+fn bad_config_ttl_exits_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a/a.rs", "fn a() {}");
+    std::fs::write(root.join(".trail.toml"), "[lease]\nttl_secs = -100\n").unwrap();
+    trail(root)
+        .args(["next", "--task", "t"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("ttl_secs"));
+}

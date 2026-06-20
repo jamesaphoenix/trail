@@ -96,8 +96,13 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
-    /// Reclaim expired leases and compact the database.
-    Gc,
+    /// Reclaim expired leases (and compact the database with --vacuum).
+    Gc {
+        /// Also run VACUUM to compact the DB file (best-effort; may be skipped
+        /// if another connection holds the database).
+        #[arg(long)]
+        vacuum: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -211,7 +216,8 @@ fn run(cli: Cli) -> trail_core::Result<u8> {
         }
         Cmd::Done { task, path, agent } => {
             let mut store = Store::open(&db)?;
-            let res = store.complete(&task, &path, agent.as_deref(), WorkStatus::Done, now)?;
+            let res =
+                store.complete(&task, &path, agent.as_deref(), WorkStatus::Done, None, now)?;
             emit(&res);
             Ok(EXIT_OK)
         }
@@ -219,10 +225,17 @@ fn run(cli: Cli) -> trail_core::Result<u8> {
             task,
             path,
             agent,
-            reason: _,
+            reason,
         } => {
             let mut store = Store::open(&db)?;
-            let res = store.complete(&task, &path, agent.as_deref(), WorkStatus::Skipped, now)?;
+            let res = store.complete(
+                &task,
+                &path,
+                agent.as_deref(),
+                WorkStatus::Skipped,
+                reason.as_deref(),
+                now,
+            )?;
             emit(&res);
             Ok(EXIT_OK)
         }
@@ -257,9 +270,9 @@ fn run(cli: Cli) -> trail_core::Result<u8> {
             emit(&store.reset(&task, all)?);
             Ok(EXIT_OK)
         }
-        Cmd::Gc => {
+        Cmd::Gc { vacuum } => {
             let mut store = Store::open(&db)?;
-            emit(&store.gc(now)?);
+            emit(&store.gc(now, vacuum)?);
             Ok(EXIT_OK)
         }
     }

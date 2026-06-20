@@ -18,4 +18,4 @@ pub use model::{
     StaticSignal, StatusReport, Strategy, SweepInfo, WorkStatus,
 };
 pub use store::Store;
-pub use walk::{scan, WalkOutcome};
+pub use walk::{normalize_rel, scan, WalkOutcome};

@@ -14,6 +14,15 @@ pub enum Error {
     #[error("walk error: {0}")]
     Walk(String),
 
+    /// A done/skip targeted a path that is not a work item in any sweep
+    /// (typo, wrong task, or excluded by config).
+    #[error("{0}")]
+    NotInSweep(String),
+
+    /// `sweep new` was asked to open a sweep while one is still active.
+    #[error("{0}")]
+    SweepActive(String),
+
     #[error("{0}")]
     Other(String),
 }
