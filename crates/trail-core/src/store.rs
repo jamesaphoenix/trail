@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS work_items (
   PRIMARY KEY (task_name, sweep, path)
 );
 CREATE INDEX IF NOT EXISTS idx_claim ON work_items (task_name, sweep, status, score);
+-- Lets complete() seek a folder by (task, path) instead of scanning every
+-- work_item for the task across all accumulated sweeps.
+CREATE INDEX IF NOT EXISTS idx_work_path ON work_items (task_name, path);
 CREATE TABLE IF NOT EXISTS visits (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   task_name  TEXT NOT NULL,
@@ -1391,6 +1394,33 @@ mod tests {
         claimed.sort();
         claimed.dedup();
         assert_eq!(claimed.len(), before, "a folder was leased to two agents");
+    }
+
+    #[test]
+    fn complete_lookup_seeks_via_path_index() {
+        // Guard against the per-completion full table scan: the target-resolution
+        // query must seek on idx_work_path, not scan every row for the task.
+        let s = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = s
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT sweep, status FROM work_items
+                   WHERE task_name = ?1 AND path = ?2
+                   ORDER BY (status IN ('pending', 'leased')) DESC,
+                            coalesce(lease_owner = ?3, 0) DESC, sweep DESC
+                   LIMIT 1",
+            )
+            .unwrap()
+            .query_map(params!["t", "p", "a"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let detail = plan.join(" | ");
+        assert!(
+            detail.contains("idx_work_path"),
+            "complete() query did not use idx_work_path: {detail}"
+        );
     }
 
     proptest::proptest! {

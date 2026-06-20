@@ -43,11 +43,11 @@ jobs:
         run: cargo test -p trail-core --features churn --verbose
 
   msrv:
-    name: MSRV (rust-version floor)
+    name: MSRV 1.85 (rust-version floor)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       - name: build + test on the declared MSRV
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --locked --verbose

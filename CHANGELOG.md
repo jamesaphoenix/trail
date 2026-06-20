@@ -21,7 +21,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.trail.toml.example` identical to it.
 - `trail-cli`'s path dependency on `trail-core` carries a version; crates.io
   metadata (repository/homepage/keywords/categories) and a declared MSRV
-  (`rust-version = 1.82`, CI-verified) added.
+  (`rust-version = 1.85`, CI-verified) added.
 - Removed accidentally-committed Python bytecode; `.gitignore` now covers
   `__pycache__/`, `*.py[cod]`, and `node_modules/`.
 

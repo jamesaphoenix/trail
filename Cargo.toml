@@ -5,8 +5,9 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# CI verifies this floor with a pinned-toolchain job; bump if a dep raises it.
-rust-version = "1.82"
+# Floor set by the dependency tree (clap 4.6 / toml 1.1 / ignore 0.4.26 are
+# edition-2024 crates needing Rust 1.85). CI verifies this with a pinned job.
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/Just-Understanding-Data-Ltd/trail"
 homepage = "https://github.com/Just-Understanding-Data-Ltd/trail"
