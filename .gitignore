@@ -1,0 +1,11 @@
+# Rust build output
+/target
+
+# trail runtime state (the SQLite DB lives here; never commit it)
+.trail/
+
+# Local config generated from the example
+.trail.toml
+
+# macOS
+.DS_Store

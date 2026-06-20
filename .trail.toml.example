@@ -1,0 +1,31 @@
+# trail config. Commit this file; the state DB under .trail/ is gitignored.
+# Copy to `.trail.toml` and edit. `trail init` writes this example if absent.
+
+[scan]
+# Extra glob patterns layered on top of the ignore-crate defaults.
+# .gitignore and sane language defaults (target, node_modules, .git, dist,
+# __pycache__, .venv, etc.) are already excluded for free.
+include = ["**/*"]
+exclude = ["**/migrations/**"]
+# Respect .gitignore / .ignore files while walking.
+respect_gitignore = true
+# Skip folders that directly contain fewer than this many files.
+min_files = 1
+
+[strategy]
+# round-robin | weighted | random
+default = "weighted"
+# Seed for the `random` strategy (reproducible orderings).
+seed = 42
+# weighted: blend of recency (staleness) vs static weight. 1.0 = pure recency.
+alpha = 0.6
+# Recency decay half-life in seconds (default 7 days). A folder visited one
+# half-life ago has ~half the recency priority of a never-visited folder.
+half_life_secs = 604800
+# Static signal used as folder weight: file_count | size_bytes | churn
+static_signal = "file_count"
+
+[lease]
+# How long a claimed folder stays leased before it is reclaimed for another
+# agent (covers crashed/stalled agents). Default 15 minutes.
+ttl_secs = 900
