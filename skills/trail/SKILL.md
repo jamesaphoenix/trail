@@ -77,14 +77,14 @@ required only when multiple agents share a task.
 |---------|--------------|------|
 | `trail init` | Scan the tree, register the folder snapshot, write `.trail.toml.example`. | 0 |
 | `trail next --task <t> [--agent <id>] [--strategy <s>] [--auto-sweep]` | Claim + lease the next folder. Bootstraps the first sweep automatically. `--auto-sweep` rolls into a new sweep instead of reporting complete. | 0 / 3 / 4 |
-| `trail done --task <t> --path <p> [--agent <id>]` | Mark the folder covered; append to history. | 0 |
-| `trail skip --task <t> --path <p> [--agent <id>] [--reason <r>]` | Mark covered-but-skipped; append to history. | 0 |
+| `trail done --task <t> --path <p> [--agent <id>]` | Mark the folder covered; append to history. Errors (exit 1) if the path is not an active work item; re-doing a finished one is a no-op. | 0/1 |
+| `trail skip --task <t> --path <p> [--agent <id>] [--reason <r>]` | Mark covered-but-skipped; append to history (with reason). Same miss-errors as `done`. | 0/1 |
 | `trail status --task <t>` | Coverage of the latest sweep. | 0 |
 | `trail list --task <t> [--state pending\|leased\|done\|skipped]` | Work items in the latest sweep, ordered by score. | 0 |
-| `trail sweep new --task <t> [--rescan]` | Open a fresh sweep (the outer loop owns re-running). | 0 |
+| `trail sweep new --task <t> [--rescan]` | Open a fresh sweep (the outer loop owns re-running). Errors if a sweep is still active. | 0/1 |
 | `trail sweep show --task <t>` | Show the latest sweep. | 0 |
 | `trail reset --task <t> [--all]` | Clear sweeps; `--all` also wipes visit history. | 0 |
-| `trail gc` | Reclaim expired leases and compact the DB. | 0 |
+| `trail gc [--vacuum]` | Reclaim expired leases; `--vacuum` also compacts the DB (best-effort). | 0 |
 
 `--root <dir>` is global and sets the project root (defaults to the cwd). State
 lives at `<root>/.trail/state.db`; config at `<root>/.trail.toml`.
@@ -92,16 +92,26 @@ lives at `<root>/.trail/state.db`; config at `<root>/.trail.toml`.
 ### Output shapes
 
 ```jsonc
+// init
+{"folders":42,"excluded":3,"wrote_example_config":true}
 // next (ok)
 {"status":"ok","task":"refine","sweep":1,"path":"src/api","score":0.81,"lease_expires_at":1781990000,"remaining":7}
-// next (sweep complete) — exit 3
-{"status":"sweep-complete","task":"refine","sweep":1,"covered":8}
+// next (sweep complete) — exit 3. total==0 (+ a note) means nothing was registered.
+{"status":"sweep-complete","task":"refine","sweep":1,"covered":8,"total":8}
 // next (none available) — exit 4
 {"status":"none-available","task":"refine","sweep":1,"leased_outstanding":2}
 // done / skip
 {"status":"done","task":"refine","sweep":1,"path":"src/api","remaining":6,"sweep_complete":false}
 // status
 {"task":"refine","sweep":1,"sweep_status":"active","total":8,"done":2,"leased":1,"pending":5,"skipped":0,"percent":25.0}
+// list (array of rows)
+[{"path":"src/api","status":"pending","score":0.81,"lease_owner":null,"lease_expires_at":null,"visited_at":null}]
+// sweep show
+{"task":"refine","sweep":1,"sweep_status":"active","total":8,"started_at":1781989000,"completed_at":null}
+// reset
+{"task":"refine","cleared_sweeps":2,"cleared_history":false}
+// gc
+{"reclaimed_leases":1}
 ```
 
 ## How it works (just enough)
@@ -128,3 +138,7 @@ lives at `<root>/.trail/state.db`; config at `<root>/.trail.toml`.
 - Commit `.trail.toml`; gitignore `.trail/` (the state DB).
 - Re-`init` (or `sweep new --rescan`) after the tree changes a lot; new folders
   are treated as maximally stale and surface early.
+- A stalled sweep waits up to `lease.ttl_secs` (default 900s) for a crashed
+  agent's lease to expire. For fast loops, lower `lease.ttl_secs` in
+  `.trail.toml` so the exit-4 wait is short; `trail gc` reclaims expired leases
+  on demand.

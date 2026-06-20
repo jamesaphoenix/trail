@@ -1,0 +1,34 @@
+# Changelog
+
+All notable changes to this project are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0]
+
+Initial release.
+
+### Added
+
+- `trail-core`: folder walking with sane excludes (`.gitignore` + language
+  defaults via the `ignore` crate), recency + static-weight scoring, three
+  ordering strategies (`weighted`, `round-robin`, seeded `random`), and a
+  SQLite-backed store with atomic claim + lease so parallel agents never get
+  the same folder.
+- `trail` CLI: `init`, `next`, `done`, `skip`, `status`, `list`, `sweep new`,
+  `sweep show`, `reset`, `gc`. Every command prints one JSON object; exit codes
+  carry the loop outcome (`0` ok, `3` sweep-complete, `4` none-available,
+  `1` error, `2` usage).
+- One-pass coverage per sweep with per-task-name memory across sweeps: a sweep's
+  ordering is frozen from staleness (time since last visit under the task) plus
+  a static weight (file count / size / optional git churn).
+- Lease TTL with automatic reclamation of crashed agents' folders.
+- Optional `churn` feature (git churn as the static weight, via vendored
+  libgit2).
+- Thin Python and TypeScript/Node wrappers that shell out to the binary.
+- `SKILL.md` documenting the agent loop, and a sample `.trail.toml`.
+
+[Unreleased]: https://example.com/compare/v0.1.0...HEAD
+[0.1.0]: https://example.com/releases/tag/v0.1.0

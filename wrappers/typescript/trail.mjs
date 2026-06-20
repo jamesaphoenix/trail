@@ -53,18 +53,29 @@ export function init(root) {
 /**
  * Claim the next folder. Returns the folder object on success, or null when the
  * sweep is complete. Blocks and retries while folders are only leased elsewhere.
+ *
+ * The exit-4 retry is unbounded by default (a crashed agent's lease frees up
+ * after lease.ttl_secs). Set opts.maxAttempts to cap it and throw instead.
  */
 export function claim(task, opts = {}) {
-  const { agent, root, strategy, autoSweep = false, pollMs = 2000 } = opts;
+  const { agent, root, strategy, autoSweep = false, pollMs = 2000, maxAttempts } = opts;
   const args = ["next", "--task", task];
   if (agent) args.push("--agent", agent);
   if (strategy) args.push("--strategy", strategy);
   if (autoSweep) args.push("--auto-sweep");
+  let attempts = 0;
   for (;;) {
     const { code, data } = run(args, root);
     if (code === EXIT_OK) return data;
     if (code === EXIT_SWEEP_COMPLETE) return null;
     if (code === EXIT_NONE_AVAILABLE) {
+      attempts += 1;
+      if (maxAttempts != null && attempts >= maxAttempts) {
+        throw new TrailError(
+          `no folder available after ${attempts} attempts (all leased elsewhere); ` +
+            "consider a shorter lease.ttl_secs"
+        );
+      }
       sleepSync(pollMs);
       continue;
     }
@@ -101,5 +112,24 @@ export function status(task, opts = {}) {
 export function newSweep(task, opts = {}) {
   const args = ["sweep", "new", "--task", task];
   if (opts.rescan) args.push("--rescan");
+  return run(args, opts.root).data;
+}
+
+export function list(task, opts = {}) {
+  const args = ["list", "--task", task];
+  if (opts.state) args.push("--state", opts.state);
+  const data = run(args, opts.root).data;
+  return Array.isArray(data) ? data : [];
+}
+
+export function reset(task, opts = {}) {
+  const args = ["reset", "--task", task];
+  if (opts.all) args.push("--all");
+  return run(args, opts.root).data;
+}
+
+export function gc(opts = {}) {
+  const args = ["gc"];
+  if (opts.vacuum) args.push("--vacuum");
   return run(args, opts.root).data;
 }

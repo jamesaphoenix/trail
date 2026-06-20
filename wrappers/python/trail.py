@@ -22,7 +22,7 @@ import json
 import os
 import subprocess
 import time
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 # Exit codes mirrored from the CLI.
 EXIT_OK = 0
@@ -39,21 +39,21 @@ def _bin() -> str:
     return os.environ.get("TRAIL_BIN", "trail")
 
 
-def _run(args: list[str], root: Optional[str]) -> tuple[int, dict]:
+def _run(args: list[str], root: Optional[str]) -> tuple[int, Any]:
     cmd = [_bin()]
     if root:
         cmd += ["--root", root]
     cmd += args
     proc = subprocess.run(cmd, capture_output=True, text=True)
     out = proc.stdout.strip()
-    data: dict = {}
+    data: Any = {}
     if out:
         try:
             data = json.loads(out.splitlines()[-1])
         except json.JSONDecodeError:
             data = {}
     if proc.returncode == EXIT_ERROR:
-        msg = data.get("error") or proc.stderr.strip() or "trail error"
+        msg = (isinstance(data, dict) and data.get("error")) or proc.stderr.strip() or "trail error"
         raise TrailError(msg)
     return proc.returncode, data
 
@@ -70,12 +70,17 @@ def claim(
     strategy: Optional[str] = None,
     auto_sweep: bool = False,
     poll_secs: float = 2.0,
+    max_attempts: Optional[int] = None,
 ) -> Optional[dict]:
     """Claim the next folder.
 
     Returns the folder dict (with `path`, `score`, ...) when one is leased, or
     ``None`` when the sweep is complete. Blocks and retries while folders are
     only leased elsewhere (exit code 4).
+
+    By default the exit-4 retry is unbounded (a crashed agent's lease frees up
+    after ``lease.ttl_secs``). Set ``max_attempts`` to cap the retries and raise
+    ``TrailError`` instead of waiting indefinitely.
     """
     args = ["next", "--task", task]
     if agent:
@@ -84,6 +89,7 @@ def claim(
         args += ["--strategy", strategy]
     if auto_sweep:
         args += ["--auto-sweep"]
+    attempts = 0
     while True:
         code, data = _run(args, root)
         if code == EXIT_OK:
@@ -91,6 +97,12 @@ def claim(
         if code == EXIT_SWEEP_COMPLETE:
             return None
         if code == EXIT_NONE_AVAILABLE:
+            attempts += 1
+            if max_attempts is not None and attempts >= max_attempts:
+                raise TrailError(
+                    f"no folder available after {attempts} attempts "
+                    "(all leased elsewhere); consider a shorter lease.ttl_secs"
+                )
             time.sleep(poll_secs)
             continue
         raise TrailError(data.get("error", f"unexpected exit code {code}"))
@@ -102,11 +114,17 @@ def folders(
     root: Optional[str] = None,
     strategy: Optional[str] = None,
     auto_sweep: bool = False,
+    max_attempts: Optional[int] = None,
 ) -> Iterator[dict]:
     """Yield folder dicts until the sweep completes. Remember to call `done`."""
     while True:
         folder = claim(
-            task, agent=agent, root=root, strategy=strategy, auto_sweep=auto_sweep
+            task,
+            agent=agent,
+            root=root,
+            strategy=strategy,
+            auto_sweep=auto_sweep,
+            max_attempts=max_attempts,
         )
         if folder is None:
             return
@@ -147,4 +165,31 @@ def new_sweep(task: str, rescan: bool = False, root: Optional[str] = None) -> di
     args = ["sweep", "new", "--task", task]
     if rescan:
         args += ["--rescan"]
+    return _run(args, root)[1]
+
+
+def list_items(
+    task: str, state: Optional[str] = None, root: Optional[str] = None
+) -> list:
+    """List work items in the latest sweep (optionally filtered by state)."""
+    args = ["list", "--task", task]
+    if state:
+        args += ["--state", state]
+    _, data = _run(args, root)
+    return data if isinstance(data, list) else []
+
+
+def reset(task: str, all: bool = False, root: Optional[str] = None) -> dict:
+    """Clear a task's sweeps (and history with all=True)."""
+    args = ["reset", "--task", task]
+    if all:
+        args += ["--all"]
+    return _run(args, root)[1]
+
+
+def gc(vacuum: bool = False, root: Optional[str] = None) -> dict:
+    """Reclaim expired leases (and compact the DB with vacuum=True)."""
+    args = ["gc"]
+    if vacuum:
+        args += ["--vacuum"]
     return _run(args, root)[1]

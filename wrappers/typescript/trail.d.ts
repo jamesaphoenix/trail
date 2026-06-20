@@ -14,6 +14,32 @@ export interface ClaimOpts {
   autoSweep?: boolean;
   /** Poll interval (ms) while folders are only leased elsewhere. */
   pollMs?: number;
+  /** Cap the exit-4 retry loop; throws TrailError once exceeded. */
+  maxAttempts?: number;
+}
+
+export interface ListOpts {
+  root?: string;
+  state?: "pending" | "leased" | "done" | "skipped";
+}
+
+export interface ListRow {
+  path: string;
+  status: "pending" | "leased" | "done" | "skipped";
+  score: number;
+  lease_owner: string | null;
+  lease_expires_at: number | null;
+  visited_at: number | null;
+}
+
+export interface GcResult {
+  reclaimed_leases: number;
+}
+
+export interface ResetResult {
+  task: string;
+  cleared_sweeps: number;
+  cleared_history: boolean;
 }
 
 export interface Folder {
@@ -77,3 +103,6 @@ export function done(task: string, path: string, opts?: CmdOpts): CompleteResult
 export function skip(task: string, path: string, opts?: CmdOpts): CompleteResult;
 export function status(task: string, opts?: CmdOpts): StatusReport;
 export function newSweep(task: string, opts?: CmdOpts): SweepInfo;
+export function list(task: string, opts?: ListOpts): ListRow[];
+export function reset(task: string, opts?: CmdOpts): ResetResult;
+export function gc(opts?: { root?: string; vacuum?: boolean }): GcResult;

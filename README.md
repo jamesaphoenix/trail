@@ -37,9 +37,18 @@ wrappers), so any harness that can run a shell command can coordinate cleanly.
 
 ```bash
 cargo build --release          # binary at target/release/trail
-# optional: enable the git-churn static signal
+
+# install the `trail` binary onto your PATH:
+cargo install --path crates/trail-cli
+# (the crate is `trail-cli` but its [[bin]] is named `trail`, so the installed
+#  command is `trail`.)
+
+# optional: enable the git-churn static signal (needs cmake for vendored libgit2)
 cargo build --release --features churn
 ```
+
+The language wrappers locate the binary via `PATH`, or via the `TRAIL_BIN`
+environment variable (e.g. `TRAIL_BIN=/path/to/trail`).
 
 ## Use
 
@@ -49,6 +58,9 @@ trail next --task refine --agent a1     # claim a folder (JSON on stdout)
 trail done --task refine --path src/api --agent a1
 trail status --task refine
 ```
+
+`trail init` also writes a sample `.trail.toml.example` when none exists (the
+`wrote_example_config` field reports whether it did).
 
 Exit codes carry the loop outcome: `0` ok, `3` sweep-complete, `4`
 none-available (leased elsewhere, retry), `1` error, `2` usage. See

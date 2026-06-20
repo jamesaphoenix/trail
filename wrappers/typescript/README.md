@@ -6,8 +6,11 @@ ESM with `.d.ts` types, no build step required.
 
 Requires the `trail` binary on `PATH` (or set `TRAIL_BIN=/path/to/trail`).
 
+This is a vendored reference wrapper: copy `trail.mjs` (and `trail.d.ts`) into
+your project and import it by relative path. It is not published to npm.
+
 ```js
-import * as trail from "@trail/cli-wrapper";
+import * as trail from "./trail.mjs";
 
 trail.init("/repo");
 for (const folder of trail.folders("refine", { agent: "worker-1", root: "/repo" })) {
