@@ -743,6 +743,17 @@ impl Store {
             .unwrap()
             .flatten()
     }
+
+    /// Number of recorded visits for a task, for tests.
+    fn visit_count(&self, task: &str) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM visits WHERE task_name = ?1",
+                params![task],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
 }
 
 fn pick_signal(signal: StaticSignal, file_count: i64, size_bytes: i64, churn: i64) -> i64 {
@@ -1098,6 +1109,188 @@ mod tests {
                 assert!(note.is_some(), "empty sweep should carry a note");
             }
             other => panic!("expected sweep-complete, got {other:?}"),
+        }
+    }
+
+    /// Drain a single sweep with one agent, completing as we go.
+    fn drain(s: &mut Store, task: &str, status: WorkStatus, now: i64) -> Vec<String> {
+        let mut got = Vec::new();
+        let cfg = Config::default();
+        while let NextResult::Ok { path, .. } =
+            s.next(task, &cfg, Some("a"), None, false, now).unwrap()
+        {
+            got.push(path.clone());
+            s.complete(task, &path, Some("a"), status, None, now)
+                .unwrap();
+        }
+        got
+    }
+
+    #[test]
+    fn skip_heavy_sweep_completes_with_zero_percent() {
+        let (mut s, _cfg) = seeded(2);
+        let covered = drain(&mut s, "t", WorkStatus::Skipped, NOW);
+        assert_eq!(covered.len(), 2);
+        let st = s.status("t").unwrap();
+        assert_eq!(st.skipped, 2);
+        assert_eq!(st.done, 0);
+        assert_eq!(st.percent, 0.0);
+        assert_eq!(st.sweep_status, "complete");
+    }
+
+    #[test]
+    fn reset_retains_history_unless_all() {
+        let (mut s, _cfg) = seeded(2);
+        drain(&mut s, "t", WorkStatus::Done, 100);
+        assert!(s.visit_count("t") > 0);
+        // Plain reset clears the board but keeps the task's memory.
+        let r = s.reset("t", false).unwrap();
+        assert!(!r.cleared_history);
+        assert!(s.visit_count("t") > 0, "history retained");
+        // reset --all wipes the memory too.
+        let r2 = s.reset("t", true).unwrap();
+        assert!(r2.cleared_history);
+        assert_eq!(s.visit_count("t"), 0);
+    }
+
+    #[test]
+    fn multi_task_isolation_on_one_db() {
+        let (mut s, _cfg) = seeded(3);
+        drain(&mut s, "A", WorkStatus::Done, NOW); // task A fully covered
+                                                   // Task B is independent: its own pending sweep over the same folders.
+        let remaining = match s
+            .next("B", &Config::default(), Some("b"), None, false, NOW)
+            .unwrap()
+        {
+            NextResult::Ok { remaining, .. } => remaining,
+            other => panic!("expected ok, got {other:?}"),
+        };
+        assert_eq!(remaining, 2);
+        assert_eq!(s.status("A").unwrap().done, 3);
+        let b = s.status("B").unwrap();
+        assert_eq!(b.done, 0);
+        assert_eq!(b.leased, 1);
+    }
+
+    #[test]
+    fn gc_reclaims_expired_lease_across_sweeps() {
+        let (mut s, mut cfg) = seeded(1);
+        cfg.lease.ttl_secs = 10;
+        s.next("t", &cfg, Some("a1"), None, false, NOW).unwrap();
+        // Before expiry: nothing to reclaim.
+        assert_eq!(s.gc(NOW + 5, false).unwrap().reclaimed_leases, 0);
+        // After expiry: reclaimed, and the folder is claimable again.
+        assert_eq!(s.gc(NOW + 100, false).unwrap().reclaimed_leases, 1);
+        assert!(matches!(
+            s.next("t", &cfg, Some("a2"), None, false, NOW + 101)
+                .unwrap(),
+            NextResult::Ok { .. }
+        ));
+    }
+
+    #[test]
+    fn list_orders_by_score_and_filters_by_state() {
+        let (mut s, cfg) = seeded(3);
+        s.next("t", &cfg, Some("a1"), None, false, NOW).unwrap(); // leases one
+        let all = s.list("t", None).unwrap();
+        assert_eq!(all.len(), 3);
+        for w in all.windows(2) {
+            assert!(w[0].score >= w[1].score, "list not sorted by score desc");
+        }
+        assert_eq!(s.list("t", Some(WorkStatus::Leased)).unwrap().len(), 1);
+        assert_eq!(s.list("t", Some(WorkStatus::Pending)).unwrap().len(), 2);
+        assert!(s.list("unknown", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn status_edge_cases() {
+        let (mut s, cfg) = seeded(4);
+        // No sweep yet for this task name.
+        let none = s.status("never").unwrap();
+        assert_eq!(none.sweep_status, "none");
+        assert_eq!(none.total, 0);
+        assert_eq!(none.percent, 0.0);
+        // Partial: 1 of 4 done -> 25%.
+        s.next("t", &cfg, Some("a"), None, false, NOW).unwrap();
+        s.complete("t", "dir000", Some("a"), WorkStatus::Done, None, NOW)
+            .unwrap();
+        let st = s.status("t").unwrap();
+        assert_eq!(st.done, 1);
+        assert!((st.percent - 25.0).abs() < 1e-9);
+        assert_eq!(st.sweep_status, "active");
+    }
+
+    #[test]
+    fn tree_drift_adds_new_folder_on_rescan() {
+        let mut s = Store::open_in_memory().unwrap();
+        let cfg = Config::default();
+        s.replace_folders(&folders(2), NOW).unwrap();
+        drain(&mut s, "t", WorkStatus::Done, NOW);
+        // The tree grows; a rescan + new sweep includes the newcomer.
+        s.replace_folders(&folders(3), NOW + 1).unwrap();
+        let info = s.open_new_sweep("t", &cfg, NOW + 1).unwrap();
+        assert_eq!(info.total, 3);
+        let paths: Vec<_> = s
+            .list("t", None)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert!(paths.contains(&"dir002".to_string()));
+    }
+
+    #[test]
+    fn random_strategy_is_reproducible_across_stores() {
+        let order = || {
+            let mut s = Store::open_in_memory().unwrap();
+            let mut cfg = Config::default();
+            cfg.strategy.default = Strategy::Random;
+            cfg.strategy.seed = 12_345;
+            s.replace_folders(&folders(6), NOW).unwrap();
+            let mut got = Vec::new();
+            while let NextResult::Ok { path, .. } =
+                s.next("t", &cfg, Some("a"), None, false, NOW).unwrap()
+            {
+                got.push(path.clone());
+                s.complete("t", &path, Some("a"), WorkStatus::Done, None, NOW)
+                    .unwrap();
+            }
+            got
+        };
+        assert_eq!(order(), order(), "same seed => same drain order");
+    }
+
+    #[test]
+    fn strategy_override_persists_on_task() {
+        let (mut s, cfg) = seeded(2);
+        s.next("t", &cfg, Some("a"), Some(Strategy::Random), false, NOW)
+            .unwrap();
+        let (strat, _seed, _cur) = s.task_row("t").unwrap().unwrap();
+        assert_eq!(strat, Strategy::Random);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn draining_a_sweep_covers_every_folder_exactly_once(n in 1usize..40) {
+            let mut s = Store::open_in_memory().unwrap();
+            let cfg = Config::default();
+            s.replace_folders(&folders(n), NOW).unwrap();
+            let mut seen = std::collections::BTreeSet::new();
+            loop {
+                match s.next("t", &cfg, Some("a"), None, false, NOW).unwrap() {
+                    NextResult::Ok { path, .. } => {
+                        proptest::prop_assert!(seen.insert(path.clone()), "folder claimed twice: {}", path);
+                        s.complete("t", &path, Some("a"), WorkStatus::Done, None, NOW).unwrap();
+                    }
+                    NextResult::SweepComplete { covered, total, .. } => {
+                        proptest::prop_assert_eq!(covered, n as i64);
+                        proptest::prop_assert_eq!(total, n as i64);
+                        break;
+                    }
+                    NextResult::NoneAvailable { .. } => proptest::prop_assert!(false, "single agent saw none-available"),
+                }
+            }
+            proptest::prop_assert_eq!(seen.len(), n);
         }
     }
 }

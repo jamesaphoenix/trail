@@ -180,3 +180,56 @@ fn bad_config_ttl_exits_error() {
         .code(1)
         .stderr(predicates::str::contains("ttl_secs"));
 }
+
+#[test]
+fn done_without_a_sweep_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a/a.rs", "fn a() {}");
+    trail(root).arg("init").assert().success();
+    // Folders are registered but no sweep is open yet (no `next`): a `done` has
+    // no work item to land on, so it errors rather than silently succeeding.
+    trail(root)
+        .args(["done", "--task", "t", "--path", "a"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("not a work item"));
+}
+
+#[test]
+fn rescan_new_sweep_picks_up_added_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a/a.rs", "fn a() {}");
+    trail(root).arg("init").assert().success();
+    // Drain sweep 1 (one folder).
+    trail(root).args(["next", "--task", "t"]).assert().success();
+    trail(root)
+        .args(["done", "--task", "t", "--path", "a"])
+        .assert()
+        .success();
+    trail(root).args(["next", "--task", "t"]).assert().code(3);
+    // The tree grows; rescan into a new sweep sees both folders.
+    write(root, "b/b.rs", "fn b() {}");
+    trail(root)
+        .args(["sweep", "new", "--task", "t", "--rescan"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"total\":2"));
+}
+
+#[test]
+fn sweep_new_while_active_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a/a.rs", "fn a() {}");
+    write(root, "b/b.rs", "fn b() {}");
+    trail(root).arg("init").assert().success();
+    // Open sweep 1 and leave it active.
+    trail(root).args(["next", "--task", "t"]).assert().success();
+    trail(root)
+        .args(["sweep", "new", "--task", "t"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("still active"));
+}

@@ -142,7 +142,20 @@ fn apply_churn(root: &Path, folders: &mut [FolderStat]) -> Result<()> {
         Ok(r) => r,
         Err(_) => return Ok(()),
     };
-    let workdir = repo.workdir().unwrap_or(root).to_path_buf();
+    let workdir = match repo.workdir() {
+        Some(w) => w.to_path_buf(),
+        None => return Ok(()),
+    };
+    // Diff paths are repo-relative; folder paths are scan-root-relative. Compute
+    // the scan root's location inside the repo so the two can be re-based.
+    // Canonicalize both to survive symlinked temp dirs (/tmp -> /private/tmp).
+    let root_c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let work_c = workdir.canonicalize().unwrap_or(workdir);
+    let prefix = root_c
+        .strip_prefix(&work_c)
+        .unwrap_or(Path::new(""))
+        .to_path_buf();
+
     let mut revwalk = repo.revwalk().map_err(|e| Error::Walk(e.to_string()))?;
     if revwalk.push_head().is_err() {
         return Ok(());
@@ -169,9 +182,17 @@ fn apply_churn(root: &Path, folders: &mut [FolderStat]) -> Result<()> {
         let _ = diff.foreach(
             &mut |delta, _| {
                 if let Some(p) = delta.new_file().path() {
-                    if let Some(parent) = workdir.join(p).parent() {
-                        let rel = rel_path(root, parent);
-                        *counts.entry(rel).or_insert(0) += 1;
+                    // Re-base the repo-relative path onto the scan root, then
+                    // attribute the change to its parent folder.
+                    if let Ok(rel) = p.strip_prefix(&prefix) {
+                        if let Some(parent) = rel.parent() {
+                            let key = if parent.as_os_str().is_empty() {
+                                ".".to_string()
+                            } else {
+                                parent.to_string_lossy().replace('\\', "/")
+                            };
+                            *counts.entry(key).or_insert(0) += 1;
+                        }
                     }
                 }
                 true
@@ -256,5 +277,45 @@ mod tests {
         assert!(paths.contains(&"fat"));
         assert!(!paths.contains(&"thin"));
         assert!(out.excluded >= 1);
+    }
+
+    #[test]
+    fn normalize_rel_handles_slashes_and_prefixes() {
+        assert_eq!(normalize_rel("src/api"), "src/api");
+        assert_eq!(normalize_rel(".\\src\\api"), "src/api");
+        assert_eq!(normalize_rel("./src/api/"), "src/api");
+        assert_eq!(normalize_rel(""), ".");
+        assert_eq!(normalize_rel("."), ".");
+        assert_eq!(normalize_rel("a\\b\\c"), "a/b/c");
+    }
+
+    #[cfg(feature = "churn")]
+    #[test]
+    fn churn_counts_changes_from_git_history() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        write(&root.join("src/a.rs"), "fn a() {}");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "c1"]);
+        write(&root.join("src/a.rs"), "fn a() { /* changed */ }");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "c2"]);
+
+        let out = scan(root, &Config::default()).unwrap();
+        let src = out.folders.iter().find(|f| f.path == "src").unwrap();
+        assert!(src.churn >= 2, "expected churn >= 2, got {}", src.churn);
     }
 }

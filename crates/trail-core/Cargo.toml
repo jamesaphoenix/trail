@@ -25,5 +25,4 @@ churn = ["dep:git2"]
 
 [dev-dependencies]
 tempfile = "3"
-insta = "1"
 proptest = "1"

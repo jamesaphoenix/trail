@@ -189,4 +189,34 @@ mod tests {
         hl.strategy.half_life_secs = 0;
         assert!(matches!(hl.validate(), Err(Error::Config(_))));
     }
+
+    #[test]
+    fn invalid_toml_is_a_config_error_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".trail.toml"), "this = = not valid").unwrap();
+        let err = Config::load(dir.path()).unwrap_err();
+        match err {
+            Error::Config(msg) => assert!(msg.contains(".trail.toml")),
+            other => panic!("expected config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_config_loads_validated_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config::load(dir.path()).unwrap();
+        assert_eq!(c.strategy.default, Strategy::Weighted);
+    }
+
+    #[test]
+    fn include_catch_all_variants() {
+        let mut c = Config::default();
+        assert!(c.include_is_catch_all());
+        c.scan.include = vec!["**".to_string()];
+        assert!(c.include_is_catch_all());
+        c.scan.include = vec![];
+        assert!(c.include_is_catch_all());
+        c.scan.include = vec!["src/**".to_string()];
+        assert!(!c.include_is_catch_all());
+    }
 }

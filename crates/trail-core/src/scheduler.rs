@@ -149,4 +149,19 @@ mod tests {
         let b = score(Strategy::Weighted, 0.9, 0.1, 0.0, 1, 1, "x");
         assert!((b - (0.1 + tie_break(1, 1, "x"))).abs() < 1e-12);
     }
+
+    proptest::proptest! {
+        #[test]
+        fn score_is_always_finite(
+            recency in 0.0f64..=1.0,
+            weight in 0.0f64..=1.0,
+            alpha in -1.0f64..=2.0,
+            sweep in 1i64..10_000,
+        ) {
+            for strat in [Strategy::RoundRobin, Strategy::Weighted, Strategy::Random] {
+                let s = score(strat, recency, weight, alpha, 7, sweep, "some/path/here");
+                proptest::prop_assert!(s.is_finite(), "score not finite: {}", s);
+            }
+        }
+    }
 }
