@@ -1801,6 +1801,115 @@ mod tests {
         Store::open(&db).unwrap().assert_counters_consistent("t");
     }
 
+    #[test]
+    fn claim_query_uses_index_without_temp_btree() {
+        // Perf-regression guard: the claim subselect must seek idx_claim and
+        // NOT sort via a temp b-tree (the dropped `path ASC` win). Re-adding a
+        // secondary ORDER BY term or losing the index would fail this.
+        let s = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = s
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT rowid FROM work_items
+                   WHERE task_name = ?1 AND sweep = ?2 AND status = 'pending'
+                   ORDER BY score DESC LIMIT 1",
+            )
+            .unwrap()
+            .query_map(params!["t", 1i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let detail = plan.join(" | ");
+        assert!(
+            detail.contains("idx_claim"),
+            "claim must use idx_claim: {detail}"
+        );
+        assert!(
+            !detail.to_uppercase().contains("TEMP B-TREE"),
+            "claim must not sort via a temp b-tree: {detail}"
+        );
+    }
+
+    #[test]
+    fn concurrent_claim_complete_gc_keeps_counters_consistent() {
+        // Stress claim + complete + gc concurrently and assert the invariants
+        // hold: every folder covered once, counters consistent, correct totals,
+        // no deadlock between the IMMEDIATE transactions.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("state.db");
+        let n = 80usize;
+        let mut cfg = Config::default();
+        cfg.lease.ttl_secs = 3600;
+        {
+            let mut setup = Store::open(&db).unwrap();
+            setup.replace_folders(&folders(n), NOW).unwrap();
+            setup.open_new_sweep("t", &cfg, NOW).unwrap();
+        }
+
+        let claimed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut handles = Vec::new();
+        for tid in 0..6 {
+            let db = db.clone();
+            let cfg = cfg.clone();
+            let claimed = Arc::clone(&claimed);
+            handles.push(std::thread::spawn(move || {
+                let mut store = Store::open(&db).unwrap();
+                let agent = format!("a{tid}");
+                loop {
+                    match store
+                        .next("t", &cfg, Some(&agent), None, false, NOW)
+                        .unwrap()
+                    {
+                        NextResult::Ok { path, .. } => {
+                            claimed.lock().unwrap().push(path.clone());
+                            store
+                                .complete(
+                                    "t",
+                                    &path,
+                                    Some(&agent),
+                                    WorkStatus::Done,
+                                    None,
+                                    None,
+                                    NOW,
+                                )
+                                .unwrap();
+                        }
+                        NextResult::SweepComplete { .. } => break,
+                        NextResult::NoneAvailable { .. } => std::thread::yield_now(),
+                    }
+                }
+            }));
+        }
+        // A gc thread hammering the maintenance path under contention.
+        {
+            let db = db.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut store = Store::open(&db).unwrap();
+                for _ in 0..50 {
+                    let _ = store.gc(NOW, false);
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let store = Store::open(&db).unwrap();
+        store.assert_counters_consistent("t");
+        let st = store.status("t").unwrap();
+        assert_eq!(st.done, n as i64);
+        assert_eq!(st.pending, 0);
+        assert_eq!(st.leased, 0);
+        let mut got = Arc::try_unwrap(claimed).unwrap().into_inner().unwrap();
+        got.sort();
+        let before = got.len();
+        got.dedup();
+        assert_eq!(got.len(), before, "a folder was claimed twice");
+        assert_eq!(got.len(), n, "every folder covered exactly once");
+    }
+
     proptest::proptest! {
         #[test]
         fn draining_a_sweep_covers_every_folder_exactly_once(n in 1usize..40) {
