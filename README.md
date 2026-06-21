@@ -91,6 +91,8 @@ Thin wrappers (shell out to the binary, parse JSON):
 
 - Python: [`wrappers/python`](wrappers/python)
 - TypeScript / Node: [`wrappers/typescript`](wrappers/typescript)
+- Go: [`wrappers/go`](wrappers/go)
+- Ruby: [`wrappers/ruby`](wrappers/ruby)
 
 Native, in-process bindings (no subprocess; same shapes as the CLI):
 

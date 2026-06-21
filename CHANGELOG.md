@@ -12,6 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   0) to record findings. With the new `strategy.outcome_weight` config (default
   0 = off, so existing behavior is unchanged), folders that recently reported
   more findings surface earlier in future sweeps. Wrappers gained `found`/`clean`.
+- Go and Ruby thin wrappers (`wrappers/go`, `wrappers/ruby`) mirroring the
+  Python/TypeScript shell-out + JSON + exit-code contract, with the same
+  blocking `claim` and `found`/`clean` outcome reporting.
 - Native in-process bindings (no subprocess): `bindings/python` (pyo3, abi3
   wheel via maturin) and `bindings/node` (napi-rs). Both expose a `Trail`
   handle returning the same shapes as the CLI, and live in standalone
