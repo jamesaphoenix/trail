@@ -93,6 +93,10 @@ export interface CmdOpts {
   root?: string;
   reason?: string;
   rescan?: boolean;
+  /** Findings reported for this folder (feeds outcome-weighted ordering). */
+  found?: number;
+  /** Shorthand for found: 0. */
+  clean?: boolean;
 }
 
 export function init(root?: string): InitResult;

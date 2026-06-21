@@ -57,10 +57,15 @@ CREATE TABLE IF NOT EXISTS visits (
   visited_at INTEGER NOT NULL,
   agent_id   TEXT,
   status     TEXT NOT NULL,
-  reason     TEXT
+  reason     TEXT,
+  outcome    INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_visits_recency ON visits (task_name, path, visited_at);
 "#;
+
+/// One row fed into scoring at sweep open:
+/// (path, file_count, size_bytes, churn, last_visit, last_outcome).
+type FolderRow = (String, i64, i64, i64, Option<i64>, Option<i64>);
 
 /// Internal outcome of a single atomic claim attempt.
 enum ClaimOutcome {
@@ -101,10 +106,11 @@ impl Store {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
         conn.execute_batch(SCHEMA)?;
-        // Idempotent migration for DBs created before `visits.reason` existed.
+        // Idempotent migrations for DBs created before a column existed.
         // CREATE TABLE IF NOT EXISTS will not add a column to an existing table,
-        // so add it explicitly and ignore the duplicate-column error on fresh DBs.
+        // so add each explicitly and ignore the duplicate-column error.
         let _ = conn.execute("ALTER TABLE visits ADD COLUMN reason TEXT", []);
+        let _ = conn.execute("ALTER TABLE visits ADD COLUMN outcome INTEGER", []);
         Ok(Store { conn })
     }
 
@@ -213,23 +219,40 @@ impl Store {
         }
         let new_sweep = current + 1;
 
-        // Folder + its most recent visit time under this task (None if never).
-        let rows: Vec<(String, i64, i64, i64, Option<i64>)> = {
+        // Folder + its most recent visit time and most recent reported outcome
+        // under this task (both None if never visited / never reported).
+        let rows: Vec<FolderRow> = {
             let mut stmt = tx.prepare(
                 "SELECT f.path, f.file_count, f.size_bytes, f.churn,
                         (SELECT max(v.visited_at) FROM visits v
-                          WHERE v.task_name = ?1 AND v.path = f.path)
+                          WHERE v.task_name = ?1 AND v.path = f.path),
+                        (SELECT v.outcome FROM visits v
+                          WHERE v.task_name = ?1 AND v.path = f.path
+                            AND v.outcome IS NOT NULL
+                          ORDER BY v.visited_at DESC, v.id DESC LIMIT 1)
                  FROM folders f",
             )?;
             let it = stmt.query_map(params![task], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })?;
             it.collect::<rusqlite::Result<Vec<_>>>()?
         };
 
         let max_signal = rows
             .iter()
-            .map(|(_, fc, sz, ch, _)| pick_signal(signal, *fc, *sz, *ch))
+            .map(|(_, fc, sz, ch, _, _)| pick_signal(signal, *fc, *sz, *ch))
+            .max()
+            .unwrap_or(0);
+        let max_outcome = rows
+            .iter()
+            .filter_map(|(_, _, _, _, _, oc)| *oc)
             .max()
             .unwrap_or(0);
 
@@ -243,20 +266,25 @@ impl Store {
                 "INSERT INTO work_items (task_name, sweep, path, status, score)
                  VALUES (?1, ?2, ?3, 'pending', ?4)",
             )?;
-            for (path, fc, sz, ch, last_visit) in &rows {
+            for (path, fc, sz, ch, last_visit, last_outcome) in &rows {
                 let weight = scheduler::normalize(pick_signal(signal, *fc, *sz, *ch), max_signal);
                 let recency = match last_visit {
                     Some(lv) => scheduler::recency_priority(now - lv, cfg.strategy.half_life_secs),
                     None => 1.0, // never visited under this task = maximally stale
                 };
+                let outcome = scheduler::normalize(last_outcome.unwrap_or(0), max_outcome);
                 let score = scheduler::score(
                     strategy,
-                    recency,
-                    weight,
-                    cfg.strategy.alpha,
-                    seed,
-                    new_sweep,
-                    path,
+                    &scheduler::ScoreInputs {
+                        recency,
+                        weight,
+                        outcome,
+                        alpha: cfg.strategy.alpha,
+                        outcome_weight: cfg.strategy.outcome_weight,
+                        seed,
+                        sweep: new_sweep,
+                        path,
+                    },
                 );
                 ins.execute(params![task, new_sweep, path, score])?;
             }
@@ -483,6 +511,7 @@ impl Store {
     /// already-terminal folder is idempotent. A path that is not a work item in
     /// any sweep is an error, so a typo or a missed `init` is not silently
     /// reported as success.
+    #[allow(clippy::too_many_arguments)]
     pub fn complete(
         &mut self,
         task: &str,
@@ -490,6 +519,7 @@ impl Store {
         agent: Option<&str>,
         status: WorkStatus,
         reason: Option<&str>,
+        found: Option<i64>,
         now: i64,
     ) -> Result<CompleteResult> {
         let path = crate::walk::normalize_rel(path);
@@ -537,9 +567,10 @@ impl Store {
                 params![task, sweep, path, st, now],
             )?;
             tx.execute(
-                "INSERT INTO visits (task_name, path, sweep, visited_at, agent_id, status, reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![task, path, sweep, now, agent, st, reason],
+                "INSERT INTO visits
+                   (task_name, path, sweep, visited_at, agent_id, status, reason, outcome)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![task, path, sweep, now, agent, st, reason, found],
             )?;
             st.to_string()
         };
@@ -851,7 +882,7 @@ mod tests {
                 NextResult::Ok { path, .. } => {
                     claimed.push(path.clone());
                     let r = s
-                        .complete("t", &path, Some("a1"), WorkStatus::Done, None, NOW)
+                        .complete("t", &path, Some("a1"), WorkStatus::Done, None, None, NOW)
                         .unwrap();
                     assert_eq!(r.status, "done");
                 }
@@ -902,7 +933,7 @@ mod tests {
         for (p, t) in [("a", 100), ("b", 200), ("c", 300)] {
             // claim something then complete the specific path at time t
             let _ = s.next("t", &cfg, Some("x"), None, false, t).unwrap();
-            s.complete("t", p, Some("x"), WorkStatus::Done, None, t)
+            s.complete("t", p, Some("x"), WorkStatus::Done, None, None, t)
                 .unwrap();
         }
 
@@ -924,7 +955,7 @@ mod tests {
         loop {
             match s.next("t", &cfg, Some("a"), None, false, NOW).unwrap() {
                 NextResult::Ok { path, .. } => {
-                    s.complete("t", &path, Some("a"), WorkStatus::Done, None, NOW)
+                    s.complete("t", &path, Some("a"), WorkStatus::Done, None, None, NOW)
                         .unwrap();
                 }
                 NextResult::SweepComplete { sweep, .. } => {
@@ -1004,7 +1035,15 @@ mod tests {
                         NextResult::Ok { path, .. } => {
                             claimed.lock().unwrap().push(path.clone());
                             store
-                                .complete("t", &path, Some(&agent), WorkStatus::Done, None, NOW)
+                                .complete(
+                                    "t",
+                                    &path,
+                                    Some(&agent),
+                                    WorkStatus::Done,
+                                    None,
+                                    None,
+                                    NOW,
+                                )
                                 .unwrap();
                         }
                         NextResult::SweepComplete { .. } => break,
@@ -1037,7 +1076,7 @@ mod tests {
             NextResult::Ok { path, .. } => path,
             other => panic!("expected ok, got {other:?}"),
         };
-        s.complete("t", &path, Some("a1"), WorkStatus::Done, None, NOW)
+        s.complete("t", &path, Some("a1"), WorkStatus::Done, None, None, NOW)
             .unwrap();
 
         // A bogus path is a real miss, not silent success.
@@ -1048,6 +1087,7 @@ mod tests {
                 Some("a1"),
                 WorkStatus::Done,
                 None,
+                None,
                 NOW
             ),
             Err(Error::NotInSweep(_))
@@ -1055,7 +1095,7 @@ mod tests {
 
         // Re-completing the same real path stays Ok and reports done.
         let again = s
-            .complete("t", &path, Some("a1"), WorkStatus::Done, None, NOW)
+            .complete("t", &path, Some("a1"), WorkStatus::Done, None, None, NOW)
             .unwrap();
         assert_eq!(again.status, "done");
 
@@ -1082,7 +1122,15 @@ mod tests {
         s.next("t", &cfg, Some("a1"), None, false, NOW).unwrap();
         // A ./ prefix and backslashes still match the stored "src/api".
         let r = s
-            .complete("t", ".\\src\\api", Some("a1"), WorkStatus::Done, None, NOW)
+            .complete(
+                "t",
+                ".\\src\\api",
+                Some("a1"),
+                WorkStatus::Done,
+                None,
+                None,
+                NOW,
+            )
             .unwrap();
         assert_eq!(r.path, "src/api");
         assert_eq!(r.status, "done");
@@ -1100,7 +1148,7 @@ mod tests {
         ));
         // Drain it, then a new sweep is allowed.
         for p in ["dir000", "dir001"] {
-            let _ = s.complete("t", p, Some("a1"), WorkStatus::Done, None, NOW);
+            let _ = s.complete("t", p, Some("a1"), WorkStatus::Done, None, None, NOW);
         }
         let info = s.open_new_sweep("t", &cfg, NOW).unwrap();
         assert_eq!(info.sweep, 2);
@@ -1137,6 +1185,7 @@ mod tests {
                 Some("a1"),
                 WorkStatus::Skipped,
                 Some("flaky build"),
+                None,
                 NOW,
             )
             .unwrap();
@@ -1174,7 +1223,7 @@ mod tests {
             s.next(task, &cfg, Some("a"), None, false, now).unwrap()
         {
             got.push(path.clone());
-            s.complete(task, &path, Some("a"), status, None, now)
+            s.complete(task, &path, Some("a"), status, None, None, now)
                 .unwrap();
         }
         got
@@ -1266,7 +1315,7 @@ mod tests {
         assert_eq!(none.percent, 0.0);
         // Partial: 1 of 4 done -> 25%.
         s.next("t", &cfg, Some("a"), None, false, NOW).unwrap();
-        s.complete("t", "dir000", Some("a"), WorkStatus::Done, None, NOW)
+        s.complete("t", "dir000", Some("a"), WorkStatus::Done, None, None, NOW)
             .unwrap();
         let st = s.status("t").unwrap();
         assert_eq!(st.done, 1);
@@ -1306,7 +1355,7 @@ mod tests {
                 s.next("t", &cfg, Some("a"), None, false, NOW).unwrap()
             {
                 got.push(path.clone());
-                s.complete("t", &path, Some("a"), WorkStatus::Done, None, NOW)
+                s.complete("t", &path, Some("a"), WorkStatus::Done, None, None, NOW)
                     .unwrap();
             }
             got
@@ -1397,6 +1446,47 @@ mod tests {
     }
 
     #[test]
+    fn outcome_feedback_resurfaces_hot_folders() {
+        // With outcome_weight > 0 and equal recency/weight, the folder that
+        // reported the most findings leads the next sweep.
+        let mut s = Store::open_in_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.strategy.outcome_weight = 0.6;
+        let fs: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|p| FolderStat {
+                path: p.to_string(),
+                file_count: 1,
+                size_bytes: 1,
+                churn: 0,
+            })
+            .collect();
+        s.replace_folders(&fs, 0).unwrap();
+
+        // Sweep 1 at t=100: a is hot (10 findings), b and c are clean.
+        s.next("t", &cfg, Some("x"), None, false, 100).unwrap();
+        s.complete("t", "a", Some("x"), WorkStatus::Done, None, Some(10), 100)
+            .unwrap();
+        s.complete("t", "b", Some("x"), WorkStatus::Done, None, Some(0), 100)
+            .unwrap();
+        s.complete("t", "c", Some("x"), WorkStatus::Done, None, Some(0), 100)
+            .unwrap();
+
+        // Sweep 2 at the same instant (recency equal): the hot folder leads.
+        let first = match s.next("t", &cfg, Some("x"), None, true, 100).unwrap() {
+            NextResult::Ok { path, sweep, .. } => {
+                assert_eq!(sweep, 2);
+                path
+            }
+            other => panic!("expected ok, got {other:?}"),
+        };
+        assert_eq!(
+            first, "a",
+            "the folder with the most findings should resurface first"
+        );
+    }
+
+    #[test]
     fn complete_lookup_seeks_via_path_index() {
         // Guard against the per-completion full table scan: the target-resolution
         // query must seek on idx_work_path, not scan every row for the task.
@@ -1434,7 +1524,7 @@ mod tests {
                 match s.next("t", &cfg, Some("a"), None, false, NOW).unwrap() {
                     NextResult::Ok { path, .. } => {
                         proptest::prop_assert!(seen.insert(path.clone()), "folder claimed twice: {}", path);
-                        s.complete("t", &path, Some("a"), WorkStatus::Done, None, NOW).unwrap();
+                        s.complete("t", &path, Some("a"), WorkStatus::Done, None, None, NOW).unwrap();
                     }
                     NextResult::SweepComplete { covered, total, .. } => {
                         proptest::prop_assert_eq!(covered, n as i64);

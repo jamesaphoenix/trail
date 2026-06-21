@@ -236,6 +236,31 @@ fn completions_generate_for_each_shell() {
 }
 
 #[test]
+fn done_accepts_found_and_clean_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a/a.rs", "x");
+    write(root, "b/b.rs", "x");
+    trail(root).arg("init").assert().success();
+    trail(root).args(["next", "--task", "t"]).assert().success();
+    trail(root)
+        .args(["done", "--task", "t", "--path", "a", "--found", "3"])
+        .assert()
+        .success();
+    trail(root)
+        .args(["done", "--task", "t", "--path", "b", "--clean"])
+        .assert()
+        .success();
+    // --found and --clean are mutually exclusive (clap usage error).
+    trail(root)
+        .args([
+            "done", "--task", "t", "--path", "a", "--found", "1", "--clean",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn completions_survive_a_closed_pipe() {
     // Mirrors `trail completions bash | true`: close the read end before the
     // child writes, so the write hits EPIPE. Must not panic (exit 101).

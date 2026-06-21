@@ -77,8 +77,8 @@ required only when multiple agents share a task.
 |---------|--------------|------|
 | `trail init` | Scan the tree, register the folder snapshot, write `.trail.toml.example`. | 0 |
 | `trail next --task <t> [--agent <id>] [--strategy <s>] [--auto-sweep]` | Claim + lease the next folder. Bootstraps the first sweep automatically. `--auto-sweep` rolls into a new sweep instead of reporting complete. | 0 / 3 / 4 |
-| `trail done --task <t> --path <p> [--agent <id>]` | Mark the folder covered; append to history. Errors (exit 1) if the path is not an active work item; re-doing a finished one is a no-op. | 0/1 |
-| `trail skip --task <t> --path <p> [--agent <id>] [--reason <r>]` | Mark covered-but-skipped; append to history (with reason). Same miss-errors as `done`. | 0/1 |
+| `trail done --task <t> --path <p> [--agent <id>] [--found N \| --clean]` | Mark the folder covered; append to history. Errors (exit 1) if the path is not an active work item; re-doing a finished one is a no-op. `--found N` / `--clean` records findings for outcome weighting. | 0/1 |
+| `trail skip --task <t> --path <p> [--agent <id>] [--reason <r>] [--found N \| --clean]` | Mark covered-but-skipped; append to history (with reason). Same miss-errors as `done`. | 0/1 |
 | `trail status --task <t>` | Coverage of the latest sweep. | 0 |
 | `trail list --task <t> [--state pending\|leased\|done\|skipped]` | Work items in the latest sweep, ordered by score. | 0 |
 | `trail sweep new --task <t> [--rescan]` | Open a fresh sweep (the outer loop owns re-running). Errors if a sweep is still active. | 0/1 |
@@ -127,6 +127,11 @@ lives at `<root>/.trail/state.db`; config at `<root>/.trail.toml`.
 - **Strategies** only change the order of the one-pass drain: `weighted`
   (default), `round-robin` (pure least-recently-visited), `random` (seeded,
   reproducible).
+- **Outcome feedback** (opt-in): report findings with `done --found N` (or
+  `--clean` for 0). When `strategy.outcome_weight > 0` in `.trail.toml`, folders
+  that recently reported more findings are surfaced earlier in future sweeps,
+  and clean ones fade. Defaults to off (`outcome_weight = 0`), so behavior is
+  unchanged unless you opt in.
 - **Leases** make parallel work safe: a claimed folder is held for
   `lease.ttl_secs`; if the agent dies, the lease expires and the folder returns
   to the pool, so a sweep only completes when every folder is genuinely covered.

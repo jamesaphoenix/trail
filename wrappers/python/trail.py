@@ -131,11 +131,31 @@ def folders(
         yield folder
 
 
-def done(task: str, path: str, agent: Optional[str] = None, root: Optional[str] = None) -> dict:
-    """Mark a folder covered and append it to the task's history."""
+def _outcome_args(found: Optional[int], clean: bool) -> list[str]:
+    if clean:
+        return ["--clean"]
+    if found is not None:
+        return ["--found", str(found)]
+    return []
+
+
+def done(
+    task: str,
+    path: str,
+    agent: Optional[str] = None,
+    root: Optional[str] = None,
+    found: Optional[int] = None,
+    clean: bool = False,
+) -> dict:
+    """Mark a folder covered and append it to the task's history.
+
+    Pass ``found=N`` (or ``clean=True`` for 0) to report findings; with
+    ``strategy.outcome_weight > 0`` this biases future sweep ordering.
+    """
     args = ["done", "--task", task, "--path", path]
     if agent:
         args += ["--agent", agent]
+    args += _outcome_args(found, clean)
     return _run(args, root)[1]
 
 
@@ -145,6 +165,8 @@ def skip(
     agent: Optional[str] = None,
     reason: Optional[str] = None,
     root: Optional[str] = None,
+    found: Optional[int] = None,
+    clean: bool = False,
 ) -> dict:
     """Mark a folder covered-but-skipped."""
     args = ["skip", "--task", task, "--path", path]
@@ -152,6 +174,7 @@ def skip(
         args += ["--agent", agent]
     if reason:
         args += ["--reason", reason]
+    args += _outcome_args(found, clean)
     return _run(args, root)[1]
 
 

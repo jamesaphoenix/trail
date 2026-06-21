@@ -61,6 +61,13 @@ enum Cmd {
         path: String,
         #[arg(long)]
         agent: Option<String>,
+        /// Findings reported for this folder. With strategy.outcome_weight > 0,
+        /// higher counts pull this folder up in future sweeps.
+        #[arg(long, conflicts_with = "clean")]
+        found: Option<i64>,
+        /// Shorthand for --found 0 (folder was clean).
+        #[arg(long)]
+        clean: bool,
     },
     /// Mark a folder skipped (counts as covered, recorded in history).
     Skip {
@@ -72,6 +79,10 @@ enum Cmd {
         agent: Option<String>,
         #[arg(long)]
         reason: Option<String>,
+        #[arg(long, conflicts_with = "clean")]
+        found: Option<i64>,
+        #[arg(long)]
+        clean: bool,
     },
     /// Coverage snapshot for the task's latest sweep.
     Status {
@@ -234,10 +245,23 @@ fn run(cli: Cli) -> trail_core::Result<u8> {
                 NextResult::NoneAvailable { .. } => EXIT_NONE_AVAILABLE,
             })
         }
-        Cmd::Done { task, path, agent } => {
+        Cmd::Done {
+            task,
+            path,
+            agent,
+            found,
+            clean,
+        } => {
             let mut store = Store::open(&db)?;
-            let res =
-                store.complete(&task, &path, agent.as_deref(), WorkStatus::Done, None, now)?;
+            let res = store.complete(
+                &task,
+                &path,
+                agent.as_deref(),
+                WorkStatus::Done,
+                None,
+                resolve_found(found, clean),
+                now,
+            )?;
             emit(&res);
             Ok(EXIT_OK)
         }
@@ -246,6 +270,8 @@ fn run(cli: Cli) -> trail_core::Result<u8> {
             path,
             agent,
             reason,
+            found,
+            clean,
         } => {
             let mut store = Store::open(&db)?;
             let res = store.complete(
@@ -254,6 +280,7 @@ fn run(cli: Cli) -> trail_core::Result<u8> {
                 agent.as_deref(),
                 WorkStatus::Skipped,
                 reason.as_deref(),
+                resolve_found(found, clean),
                 now,
             )?;
             emit(&res);
@@ -319,6 +346,15 @@ fn emit<T: serde::Serialize>(v: &T) {
     let mut lock = stdout.lock();
     let _ = writeln!(lock, "{s}");
     let _ = lock.flush();
+}
+
+/// `--clean` is shorthand for `--found 0`; otherwise use the given count.
+fn resolve_found(found: Option<i64>, clean: bool) -> Option<i64> {
+    if clean {
+        Some(0)
+    } else {
+        found
+    }
 }
 
 fn now_unix() -> i64 {

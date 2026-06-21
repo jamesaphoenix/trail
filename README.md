@@ -29,6 +29,9 @@ wrappers), so any harness that can run a shell command can coordinate cleanly.
   a sweep is cut short, the stalest and heaviest folders were surfaced first.
 - **Strategies** only reorder the one-pass drain: `weighted` (default),
   `round-robin` (pure least-recently-visited), `random` (seeded, reproducible).
+- **Outcome feedback** (opt-in via `strategy.outcome_weight`): agents report
+  findings with `done --found N` / `--clean`, and folders that recently found
+  more are surfaced earlier in future sweeps. Off by default.
 - **Leases** make parallel work safe: a claimed folder is held for a TTL; if the
   agent dies the lease expires and the folder returns to the pool, so a sweep
   completes only when every folder is genuinely covered.

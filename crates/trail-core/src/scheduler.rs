@@ -48,30 +48,42 @@ pub fn deterministic_unit(seed: u64, sweep: i64, path: &str) -> f64 {
     (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
+/// Inputs to [`score`]. `recency`, `weight`, and `outcome` are in `[0, 1]`.
+pub struct ScoreInputs<'a> {
+    /// Staleness priority (see [`recency_priority`]).
+    pub recency: f64,
+    /// Normalized static weight (file count / size / churn).
+    pub weight: f64,
+    /// Normalized recent outcome signal (findings reported via `done --found`).
+    pub outcome: f64,
+    /// Weighted blend of recency vs static weight.
+    pub alpha: f64,
+    /// How much `outcome` pulls the weighted score (0 = ignore outcomes).
+    pub outcome_weight: f64,
+    pub seed: u64,
+    pub sweep: i64,
+    pub path: &'a str,
+}
+
 /// Final priority for a folder in a sweep.
 ///
 /// - `round-robin`: pure recency (least-recently-visited first).
-/// - `weighted`: `alpha * recency + (1 - alpha) * weight`.
-/// - `random`: the deterministic unit value (recency/weight ignored).
+/// - `weighted`: `alpha*recency + (1-alpha)*weight`, then blended with the
+///   recent `outcome` by `outcome_weight` (0 = outcomes ignored).
+/// - `random`: the deterministic unit value (recency/weight/outcome ignored).
 ///
 /// For round-robin and weighted a vanishing tie-break (seeded by the sweep
 /// number) is added so the order is total and the set of folders surfaced first
 /// rotates from sweep to sweep, instead of always truncating the same tail.
-pub fn score(
-    strategy: Strategy,
-    recency: f64,
-    weight: f64,
-    alpha: f64,
-    seed: u64,
-    sweep: i64,
-    path: &str,
-) -> f64 {
+pub fn score(strategy: Strategy, i: &ScoreInputs) -> f64 {
     match strategy {
-        Strategy::Random => deterministic_unit(seed, sweep, path),
-        Strategy::RoundRobin => recency + tie_break(seed, sweep, path),
+        Strategy::Random => deterministic_unit(i.seed, i.sweep, i.path),
+        Strategy::RoundRobin => i.recency + tie_break(i.seed, i.sweep, i.path),
         Strategy::Weighted => {
-            let a = alpha.clamp(0.0, 1.0);
-            a * recency + (1.0 - a) * weight + tie_break(seed, sweep, path)
+            let a = i.alpha.clamp(0.0, 1.0);
+            let base = a * i.recency + (1.0 - a) * i.weight;
+            let g = i.outcome_weight.clamp(0.0, 1.0);
+            (1.0 - g) * base + g * i.outcome + tie_break(i.seed, i.sweep, i.path)
         }
     }
 }
@@ -126,13 +138,33 @@ mod tests {
         }
     }
 
+    /// Build inputs with neutral outcome (outcome_weight 0) for the simple cases.
+    fn inp<'a>(
+        recency: f64,
+        weight: f64,
+        alpha: f64,
+        sweep: i64,
+        path: &'a str,
+    ) -> ScoreInputs<'a> {
+        ScoreInputs {
+            recency,
+            weight,
+            outcome: 0.0,
+            alpha,
+            outcome_weight: 0.0,
+            seed: 1,
+            sweep,
+            path,
+        }
+    }
+
     #[test]
     fn random_strategy_changes_order_across_sweeps() {
         let paths = ["a", "b", "c", "d", "e", "f"];
         let order = |sweep: i64| {
             let mut v: Vec<_> = paths
                 .iter()
-                .map(|p| (score(Strategy::Random, 1.0, 1.0, 0.6, 1, sweep, p), *p))
+                .map(|p| (score(Strategy::Random, &inp(1.0, 1.0, 0.6, sweep, p)), *p))
                 .collect();
             v.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap());
             v.into_iter().map(|(_, p)| p).collect::<Vec<_>>()
@@ -143,11 +175,33 @@ mod tests {
     #[test]
     fn weighted_blends_recency_and_weight() {
         // alpha=1.0 -> pure recency; weight irrelevant.
-        let a = score(Strategy::Weighted, 0.9, 0.1, 1.0, 1, 1, "x");
+        let a = score(Strategy::Weighted, &inp(0.9, 0.1, 1.0, 1, "x"));
         assert!((a - (0.9 + tie_break(1, 1, "x"))).abs() < 1e-12);
         // alpha=0.0 -> pure weight.
-        let b = score(Strategy::Weighted, 0.9, 0.1, 0.0, 1, 1, "x");
+        let b = score(Strategy::Weighted, &inp(0.9, 0.1, 0.0, 1, "x"));
         assert!((b - (0.1 + tie_break(1, 1, "x"))).abs() < 1e-12);
+    }
+
+    #[test]
+    fn outcome_weight_pulls_priority_when_enabled() {
+        // alpha=1 -> base score is pure recency = 0.2.
+        let without = score(Strategy::Weighted, &inp(0.2, 0.0, 1.0, 1, "x"));
+        // A high outcome with outcome_weight=0.5 blends the score upward.
+        let hot = ScoreInputs {
+            outcome: 1.0,
+            outcome_weight: 0.5,
+            ..inp(0.2, 0.0, 1.0, 1, "x")
+        };
+        assert!(
+            score(Strategy::Weighted, &hot) > without + 0.2,
+            "outcome should raise priority"
+        );
+        // outcome_weight=0 ignores the outcome entirely.
+        let ignored = ScoreInputs {
+            outcome: 1.0,
+            ..inp(0.2, 0.0, 1.0, 1, "x")
+        };
+        assert!((score(Strategy::Weighted, &ignored) - without).abs() < 1e-12);
     }
 
     proptest::proptest! {
@@ -155,11 +209,14 @@ mod tests {
         fn score_is_always_finite(
             recency in 0.0f64..=1.0,
             weight in 0.0f64..=1.0,
+            outcome in 0.0f64..=1.0,
             alpha in -1.0f64..=2.0,
+            outcome_weight in -1.0f64..=2.0,
             sweep in 1i64..10_000,
         ) {
+            let i = ScoreInputs { recency, weight, outcome, alpha, outcome_weight, seed: 7, sweep, path: "some/path/here" };
             for strat in [Strategy::RoundRobin, Strategy::Weighted, Strategy::Random] {
-                let s = score(strat, recency, weight, alpha, 7, sweep, "some/path/here");
+                let s = score(strat, &i);
                 proptest::prop_assert!(s.is_finite(), "score not finite: {}", s);
             }
         }

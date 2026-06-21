@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Outcome-feedback weighting: `done`/`skip` accept `--found N` (or `--clean` =
+  0) to record findings. With the new `strategy.outcome_weight` config (default
+  0 = off, so existing behavior is unchanged), folders that recently reported
+  more findings surface earlier in future sweeps. Wrappers gained `found`/`clean`.
 - `trail completions <shell>` prints a shell completion script (bash, zsh, fish,
   powershell, elvish) and works with no repo/config present.
 - Release workflow: tagged versions (`v*`) build prebuilt binaries for Linux,

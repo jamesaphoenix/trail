@@ -92,9 +92,16 @@ export function* folders(task, opts = {}) {
   }
 }
 
+function outcomeArgs(opts) {
+  if (opts.clean) return ["--clean"];
+  if (opts.found != null) return ["--found", String(opts.found)];
+  return [];
+}
+
 export function done(task, path, opts = {}) {
   const args = ["done", "--task", task, "--path", path];
   if (opts.agent) args.push("--agent", opts.agent);
+  args.push(...outcomeArgs(opts));
   return run(args, opts.root).data;
 }
 
@@ -102,6 +109,7 @@ export function skip(task, path, opts = {}) {
   const args = ["skip", "--task", task, "--path", path];
   if (opts.agent) args.push("--agent", opts.agent);
   if (opts.reason) args.push("--reason", opts.reason);
+  args.push(...outcomeArgs(opts));
   return run(args, opts.root).data;
 }
 

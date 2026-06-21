@@ -39,6 +39,10 @@ pub struct StrategyConfig {
     /// Recency decay half-life in seconds.
     pub half_life_secs: u64,
     pub static_signal: StaticSignal,
+    /// Weighted strategy only: how much a folder's most recent reported outcome
+    /// (`done --found N`) pulls future priority. 0.0 ignores outcomes (default,
+    /// so behavior is unchanged unless you opt in); 1.0 lets outcome dominate.
+    pub outcome_weight: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +71,7 @@ impl Default for StrategyConfig {
             alpha: 0.6,
             half_life_secs: 604_800, // 7 days
             static_signal: StaticSignal::FileCount,
+            outcome_weight: 0.0,
         }
     }
 }
@@ -114,6 +119,12 @@ impl Config {
                 "strategy.half_life_secs must be >= 1".to_string(),
             ));
         }
+        if !(0.0..=1.0).contains(&self.strategy.outcome_weight) {
+            return Err(Error::Config(format!(
+                "strategy.outcome_weight must be between 0.0 and 1.0 (got {})",
+                self.strategy.outcome_weight
+            )));
+        }
         Ok(())
     }
 
@@ -157,6 +168,9 @@ alpha = 0.6
 half_life_secs = 604800
 # Static signal used as folder weight: file_count | size_bytes | churn
 static_signal = "file_count"
+# weighted only: how much a folder's most recent reported outcome
+# (`done --found N`) pulls future priority. 0.0 ignores outcomes (default).
+outcome_weight = 0.0
 
 [lease]
 # How long a claimed folder stays leased before it is reclaimed for another

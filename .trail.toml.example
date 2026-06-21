@@ -24,6 +24,9 @@ alpha = 0.6
 half_life_secs = 604800
 # Static signal used as folder weight: file_count | size_bytes | churn
 static_signal = "file_count"
+# weighted only: how much a folder's most recent reported outcome
+# (`done --found N`) pulls future priority. 0.0 ignores outcomes (default).
+outcome_weight = 0.0
 
 [lease]
 # How long a claimed folder stays leased before it is reclaimed for another
