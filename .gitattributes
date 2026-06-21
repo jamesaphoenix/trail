@@ -1,0 +1,7 @@
+# Keep text files LF on all platforms. The Rust source is the LF source of
+# truth (and the embedded EXAMPLE_CONFIG is LF), so a CRLF Windows checkout
+# would otherwise drift from it. Also keeps shell scripts and wrappers LF.
+* text=auto eol=lf
+
+# Treat build artifacts / binaries as binary (no eol conversion).
+*.node binary

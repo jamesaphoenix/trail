@@ -267,8 +267,11 @@ mod tests {
         // re-introduce the publish-breaking path escape).
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.trail.toml.example");
+        // Normalize line endings: rustc normalizes CRLF to LF in the embedded
+        // string literal, but a Windows checkout may give the file CRLF.
         let on_disk = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .replace("\r\n", "\n");
         assert_eq!(
             on_disk,
             EXAMPLE_CONFIG,
