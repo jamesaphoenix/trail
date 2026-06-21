@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+- Draining a sweep is now O(N) instead of O(N^2): `claim`/`complete`/`status`
+  maintain per-sweep counters (O(1) reads) instead of an O(pending) `COUNT(*)`
+  on every call. Combined with `prepare_cached` on the hot path and dropping a
+  redundant sort from the claim query, per-operation cost is flat (~22us) and
+  draining 50k folders dropped from ~50s to ~1.1s (~45x). Validated on a real
+  ~24k-dir repo. `trail gc --reconcile` repairs the counters if ever needed.
+
 ### Added
 
 - Outcome-feedback weighting: `done`/`skip` accept `--found N` (or `--clean` =

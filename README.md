@@ -112,6 +112,21 @@ bindings/           native in-process bindings (pyo3 Python, napi-rs Node)
 skills/trail        SKILL.md for agents
 ```
 
+## Performance
+
+State lives in one SQLite file and the hot path is built to stay flat as a
+codebase grows: `claim`, `complete`, and `status` are O(1) (per-sweep counters,
+not `COUNT(*)` scans), and SQL is compiled once per process (`prepare_cached`).
+Draining a 50k-folder sweep takes ~1.1s (~22us per claim+complete cycle, flat
+from 1k to 50k folders). Run the micro-benchmark with:
+
+```bash
+cargo run --release --example bench -p trail-core
+```
+
+For tight loops, the native [`bindings/`](bindings) avoid per-call process
+spawn entirely. If counters ever drift, `trail gc --reconcile` rebuilds them.
+
 ## Test
 
 ```bash
