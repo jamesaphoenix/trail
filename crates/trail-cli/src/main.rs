@@ -63,8 +63,9 @@ enum Cmd {
         agent: Option<String>,
         /// Findings reported for this folder. With strategy.outcome_weight > 0,
         /// higher counts pull this folder up in future sweeps.
+        /// Findings count (non-negative); clap rejects negatives.
         #[arg(long, conflicts_with = "clean")]
-        found: Option<i64>,
+        found: Option<u64>,
         /// Shorthand for --found 0 (folder was clean).
         #[arg(long)]
         clean: bool,
@@ -79,8 +80,9 @@ enum Cmd {
         agent: Option<String>,
         #[arg(long)]
         reason: Option<String>,
+        /// Findings count (non-negative); clap rejects negatives.
         #[arg(long, conflicts_with = "clean")]
-        found: Option<i64>,
+        found: Option<u64>,
         #[arg(long)]
         clean: bool,
     },
@@ -114,6 +116,9 @@ enum Cmd {
         /// if another connection holds the database).
         #[arg(long)]
         vacuum: bool,
+        /// Recompute the sweep counters from the board, repairing any drift.
+        #[arg(long)]
+        reconcile: bool,
     },
     /// Print a shell completion script to stdout, e.g. `trail completions zsh`.
     Completions {
@@ -317,8 +322,11 @@ fn run(cli: Cli) -> trail_core::Result<u8> {
             emit(&store.reset(&task, all)?);
             Ok(EXIT_OK)
         }
-        Cmd::Gc { vacuum } => {
+        Cmd::Gc { vacuum, reconcile } => {
             let mut store = Store::open(&db)?;
+            if reconcile {
+                store.reconcile()?;
+            }
             emit(&store.gc(now, vacuum)?);
             Ok(EXIT_OK)
         }
@@ -349,11 +357,11 @@ fn emit<T: serde::Serialize>(v: &T) {
 }
 
 /// `--clean` is shorthand for `--found 0`; otherwise use the given count.
-fn resolve_found(found: Option<i64>, clean: bool) -> Option<i64> {
+fn resolve_found(found: Option<u64>, clean: bool) -> Option<i64> {
     if clean {
         Some(0)
     } else {
-        found
+        found.map(|f| f as i64)
     }
 }
 

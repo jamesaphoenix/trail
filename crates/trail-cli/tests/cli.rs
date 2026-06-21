@@ -236,6 +236,27 @@ fn completions_generate_for_each_shell() {
 }
 
 #[test]
+fn empty_task_and_negative_found_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a/a.rs", "x");
+    trail(root).arg("init").assert().success();
+    // Empty / whitespace task name is rejected, not silently turned into a sweep.
+    trail(root)
+        .args(["next", "--task", ""])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("must not be empty"));
+    trail(root).args(["next", "--task", "   "]).assert().code(1);
+    // Negative --found is rejected by clap (both forms), since findings are a count.
+    trail(root).args(["next", "--task", "t"]).assert().success();
+    trail(root)
+        .args(["done", "--task", "t", "--path", "a", "--found=-5"])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn done_accepts_found_and_clean_flags() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

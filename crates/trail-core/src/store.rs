@@ -123,7 +123,7 @@ impl Store {
         Self::from_conn(Connection::open_in_memory()?)
     }
 
-    fn from_conn(conn: Connection) -> Result<Store> {
+    fn from_conn(mut conn: Connection) -> Result<Store> {
         conn.busy_timeout(Duration::from_secs(10))?;
         // Cache enough prepared statements to cover the hot path (claim/complete
         // issue ~10 distinct statements) without thrashing the default 16-slot
@@ -140,17 +140,26 @@ impl Store {
         let _ = conn.execute("ALTER TABLE visits ADD COLUMN outcome INTEGER", []);
 
         // Schema v2: add the sweep counters and backfill them once from the
-        // work_items board (gated on user_version so it runs only on old DBs).
+        // work_items board. Run the whole upgrade under one write transaction and
+        // re-check user_version inside it, so concurrent openers single-flight it
+        // (exactly one performs ALTER + backfill; the rest see v>=2 and skip).
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < 2 {
-            for col in ["total", "pending", "leased", "done", "skipped"] {
-                let _ = conn.execute(
-                    &format!("ALTER TABLE sweeps ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
-                    [],
-                );
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let v: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if v < 2 {
+                for col in ["total", "pending", "leased", "done", "skipped"] {
+                    // Tolerate the duplicate-column error on a partially-migrated
+                    // DB; a failed statement does not abort the transaction.
+                    let _ = tx.execute(
+                        &format!("ALTER TABLE sweeps ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
+                        [],
+                    );
+                }
+                tx.execute_batch(RECOMPUTE_SWEEP_COUNTERS)?;
+                tx.pragma_update(None, "user_version", 2)?;
             }
-            conn.execute_batch(RECOMPUTE_SWEEP_COUNTERS)?;
-            conn.pragma_update(None, "user_version", 2)?;
+            tx.commit()?;
         }
         Ok(Store { conn })
     }
@@ -185,6 +194,12 @@ impl Store {
     // --- tasks / sweeps ----------------------------------------------------
 
     fn ensure_task(&self, task: &str, strategy: Strategy, seed: u64, now: i64) -> Result<()> {
+        // Reject an empty/whitespace task name (almost always a shell-quoting
+        // slip or an unset env var in an agent loop) rather than silently
+        // opening a phantom task + sweep.
+        if task.trim().is_empty() {
+            return Err(Error::Config("--task must not be empty".to_string()));
+        }
         self.conn.execute(
             "INSERT OR IGNORE INTO tasks (name, strategy, seed, current_sweep, created_at)
              VALUES (?1, ?2, ?3, 0, ?4)",
@@ -578,6 +593,14 @@ impl Store {
         found: Option<i64>,
         now: i64,
     ) -> Result<CompleteResult> {
+        // complete() only moves a folder to a terminal state. Reject Pending/
+        // Leased so the counter move (SET <from>=<from>-1, <to>=<to>+1) can never
+        // collapse to a self-cancelling double-assignment (from == to).
+        if !matches!(status, WorkStatus::Done | WorkStatus::Skipped) {
+            return Err(Error::Other(format!(
+                "complete() requires a terminal status (done/skipped), got {status:?}"
+            )));
+        }
         let path = crate::walk::normalize_rel(path);
         let st = status.as_str();
 
@@ -645,6 +668,19 @@ impl Store {
                 "SELECT pending + leased FROM sweeps WHERE task_name = ?1 AND sweep = ?2",
             )?
             .query_row(params![task, sweep], |r| r.get(0))?;
+        // In debug/test builds, catch any future counter-maintenance bug by
+        // cross-checking the maintained counter against the live board. Free in
+        // release builds.
+        #[cfg(debug_assertions)]
+        {
+            let live: i64 = tx.query_row(
+                "SELECT count(*) FROM work_items
+                  WHERE task_name = ?1 AND sweep = ?2 AND status IN ('pending', 'leased')",
+                params![task, sweep],
+                |r| r.get(0),
+            )?;
+            debug_assert_eq!(remaining, live, "sweep {sweep}: remaining counter drift");
+        }
         let sweep_complete = remaining == 0;
         if sweep_complete {
             tx.execute(
@@ -860,6 +896,18 @@ impl Store {
         Ok(GcResult {
             reclaimed_leases: reclaimed,
         })
+    }
+
+    /// Recompute every sweep's counters from the work_items board, repairing any
+    /// drift. A safety/repair path (the counters are maintained correctly on the
+    /// hot path); exposed via `trail gc --reconcile`.
+    pub fn reconcile(&mut self) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(RECOMPUTE_SWEEP_COUNTERS)?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -1675,6 +1723,82 @@ mod tests {
             NextResult::Ok { path, .. } => path,
             other => panic!("expected ok, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn complete_rejects_non_terminal_status() {
+        let (mut s, cfg) = seeded(2);
+        let p = claim_path(&mut s, &cfg, "a", NOW);
+        // A non-terminal status would make the counter move self-cancel; reject it.
+        assert!(matches!(
+            s.complete("t", &p, Some("a"), WorkStatus::Leased, None, None, NOW),
+            Err(Error::Other(_))
+        ));
+        assert!(s
+            .complete("t", &p, Some("a"), WorkStatus::Pending, None, None, NOW)
+            .is_err());
+        s.assert_counters_consistent("t"); // rejected calls left no drift
+    }
+
+    #[test]
+    fn empty_or_whitespace_task_is_rejected() {
+        let mut s = Store::open_in_memory().unwrap();
+        let cfg = Config::default();
+        s.replace_folders(&folders(1), NOW).unwrap();
+        assert!(matches!(
+            s.next("", &cfg, Some("a"), None, false, NOW),
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            s.next("   ", &cfg, Some("a"), None, false, NOW),
+            Err(Error::Config(_))
+        ));
+        let n: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "no phantom task created");
+    }
+
+    #[test]
+    fn reconcile_repairs_injected_counter_drift() {
+        let (mut s, cfg) = seeded(4);
+        claim_path(&mut s, &cfg, "a", NOW);
+        s.conn
+            .execute("UPDATE sweeps SET pending = 0, leased = 99", [])
+            .unwrap();
+        s.reconcile().unwrap();
+        s.assert_counters_consistent("t");
+    }
+
+    #[test]
+    fn v2_migration_backfills_counters_on_legacy_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("legacy.db");
+        {
+            // A v1-shaped DB: sweeps WITHOUT counter columns + a mixed board.
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE sweeps (task_name TEXT, sweep INTEGER, status TEXT,
+                     started_at INTEGER, completed_at INTEGER, PRIMARY KEY(task_name, sweep));
+                 CREATE TABLE work_items (task_name TEXT, sweep INTEGER, path TEXT, status TEXT,
+                     score REAL, lease_owner TEXT, lease_expires_at INTEGER, visited_at INTEGER,
+                     PRIMARY KEY(task_name, sweep, path));
+                 INSERT INTO sweeps VALUES ('t', 1, 'active', 0, NULL);
+                 INSERT INTO work_items VALUES
+                   ('t',1,'a','pending',1.0,NULL,NULL,NULL),
+                   ('t',1,'b','leased',1.0,'x',999,NULL),
+                   ('t',1,'c','done',1.0,NULL,NULL,0);",
+            )
+            .unwrap();
+            c.pragma_update(None, "user_version", 0).unwrap();
+        }
+        let s = Store::open(&db).unwrap(); // runs the v2 backfill
+        s.assert_counters_consistent("t");
+        let st = s.status("t").unwrap();
+        assert_eq!((st.total, st.pending, st.leased, st.done), (3, 1, 1, 1));
+        // Re-opening is a no-op (user_version is now 2).
+        Store::open(&db).unwrap().assert_counters_consistent("t");
     }
 
     proptest::proptest! {

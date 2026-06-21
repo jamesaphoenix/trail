@@ -84,7 +84,7 @@ required only when multiple agents share a task.
 | `trail sweep new --task <t> [--rescan]` | Open a fresh sweep (the outer loop owns re-running). Errors if a sweep is still active. | 0/1 |
 | `trail sweep show --task <t>` | Show the latest sweep. | 0 |
 | `trail reset --task <t> [--all]` | Clear sweeps; `--all` also wipes visit history. | 0 |
-| `trail gc [--vacuum]` | Reclaim expired leases; `--vacuum` also compacts the DB (best-effort). | 0 |
+| `trail gc [--vacuum] [--reconcile]` | Reclaim expired leases; `--vacuum` compacts the DB, `--reconcile` repairs the sweep counters from the board. | 0 |
 | `trail completions <shell>` | Print a shell completion script (bash/zsh/fish/...). | 0 |
 
 `--root <dir>` is global and sets the project root (defaults to the cwd). State
