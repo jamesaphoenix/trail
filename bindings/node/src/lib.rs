@@ -142,7 +142,12 @@ impl Trail {
 
     #[napi]
     pub fn list(&self, task: String, state: Option<String>) -> Result<serde_json::Value> {
-        let filter = state.as_deref().and_then(WorkStatus::from_db);
+        let filter = match state.as_deref() {
+            Some(s) => Some(WorkStatus::from_db(s).ok_or_else(|| {
+                e(format!("unknown state {s:?}; expected pending|leased|done|skipped"))
+            })?),
+            None => None,
+        };
         val(&self.store.list(&task, filter).map_err(e)?)
     }
 

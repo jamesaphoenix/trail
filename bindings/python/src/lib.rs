@@ -13,7 +13,7 @@
 //!     t.done("refine", folder["path"], agent="a1", found=3)
 //! ```
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -123,7 +123,14 @@ impl Trail {
 
     #[pyo3(signature = (task, state=None))]
     fn list(&self, py: Python<'_>, task: &str, state: Option<&str>) -> PyResult<PyObject> {
-        let filter = state.and_then(WorkStatus::from_db);
+        let filter = match state {
+            Some(s) => Some(WorkStatus::from_db(s).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "unknown state {s:?}; expected pending|leased|done|skipped"
+                ))
+            })?),
+            None => None,
+        };
         to_py(py, &self.store.list(task, filter).map_err(err)?)
     }
 

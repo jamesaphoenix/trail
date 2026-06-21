@@ -72,10 +72,13 @@ func (c *Client) run(args ...string) (int, []byte, []byte, error) {
 		return -1, nil, nil, err
 	}
 	out := bytes.TrimSpace(stdout.Bytes())
-	if code == ExitError {
+	// Any code outside the expected set (0 ok, 3 sweep-complete, 4 none-available)
+	// is an error - notably exit 2 (clap usage). Surface stderr rather than
+	// letting a non-claim caller hit "unexpected end of JSON input" on empty out.
+	if code != ExitOK && code != ExitSweepComplete && code != ExitNoneAvailable {
 		msg := lastLine(stderr.String())
 		if msg == "" {
-			msg = "trail error"
+			msg = fmt.Sprintf("trail exited %d", code)
 		}
 		return code, out, stderr.Bytes(), fmt.Errorf("trail: %s", msg)
 	}

@@ -50,8 +50,9 @@ module Trail
         code, data = run(*args)
         return data if code == EXIT_OK
         return nil if code == EXIT_SWEEP_COMPLETE
+        raise Error, "unexpected exit code #{code}" unless code == EXIT_NONE_AVAILABLE
 
-        sleep(@poll) if code == EXIT_NONE_AVAILABLE
+        sleep(@poll)
       end
     end
 
