@@ -32,6 +32,13 @@ CREATE TABLE IF NOT EXISTS sweeps (
   status       TEXT NOT NULL,
   started_at   INTEGER NOT NULL,
   completed_at INTEGER,
+  -- Maintained counters so 'remaining', the sweep-complete check, and status()
+  -- are O(1) reads instead of O(pending) COUNT(*) scans on every claim/complete.
+  total        INTEGER NOT NULL DEFAULT 0,
+  pending      INTEGER NOT NULL DEFAULT 0,
+  leased       INTEGER NOT NULL DEFAULT 0,
+  done         INTEGER NOT NULL DEFAULT 0,
+  skipped      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (task_name, sweep)
 );
 CREATE TABLE IF NOT EXISTS work_items (
@@ -62,6 +69,22 @@ CREATE TABLE IF NOT EXISTS visits (
 );
 CREATE INDEX IF NOT EXISTS idx_visits_recency ON visits (task_name, path, visited_at);
 "#;
+
+/// Recompute every sweep's counters from the work_items board. Used by the
+/// schema-v2 backfill. (`gc()` recomputes only the sweeps it actually touched.)
+const RECOMPUTE_SWEEP_COUNTERS: &str = "
+UPDATE sweeps SET
+  total   = (SELECT count(*) FROM work_items w
+              WHERE w.task_name = sweeps.task_name AND w.sweep = sweeps.sweep),
+  pending = (SELECT count(*) FROM work_items w
+              WHERE w.task_name = sweeps.task_name AND w.sweep = sweeps.sweep AND w.status = 'pending'),
+  leased  = (SELECT count(*) FROM work_items w
+              WHERE w.task_name = sweeps.task_name AND w.sweep = sweeps.sweep AND w.status = 'leased'),
+  done    = (SELECT count(*) FROM work_items w
+              WHERE w.task_name = sweeps.task_name AND w.sweep = sweeps.sweep AND w.status = 'done'),
+  skipped = (SELECT count(*) FROM work_items w
+              WHERE w.task_name = sweeps.task_name AND w.sweep = sweeps.sweep AND w.status = 'skipped');
+";
 
 /// One row fed into scoring at sweep open:
 /// (path, file_count, size_bytes, churn, last_visit, last_outcome).
@@ -102,6 +125,10 @@ impl Store {
 
     fn from_conn(conn: Connection) -> Result<Store> {
         conn.busy_timeout(Duration::from_secs(10))?;
+        // Cache enough prepared statements to cover the hot path (claim/complete
+        // issue ~10 distinct statements) without thrashing the default 16-slot
+        // cache, so SQL is compiled once per process, not per call.
+        conn.set_prepared_statement_cache_capacity(32);
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
@@ -111,6 +138,20 @@ impl Store {
         // so add each explicitly and ignore the duplicate-column error.
         let _ = conn.execute("ALTER TABLE visits ADD COLUMN reason TEXT", []);
         let _ = conn.execute("ALTER TABLE visits ADD COLUMN outcome INTEGER", []);
+
+        // Schema v2: add the sweep counters and backfill them once from the
+        // work_items board (gated on user_version so it runs only on old DBs).
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 2 {
+            for col in ["total", "pending", "leased", "done", "skipped"] {
+                let _ = conn.execute(
+                    &format!("ALTER TABLE sweeps ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
+                    [],
+                );
+            }
+            conn.execute_batch(RECOMPUTE_SWEEP_COUNTERS)?;
+            conn.pragma_update(None, "user_version", 2)?;
+        }
         Ok(Store { conn })
     }
 
@@ -256,10 +297,11 @@ impl Store {
             .max()
             .unwrap_or(0);
 
+        let total = rows.len() as i64;
         tx.execute(
-            "INSERT INTO sweeps (task_name, sweep, status, started_at)
-             VALUES (?1, ?2, 'active', ?3)",
-            params![task, new_sweep, now],
+            "INSERT INTO sweeps (task_name, sweep, status, started_at, total, pending)
+             VALUES (?1, ?2, 'active', ?3, ?4, ?4)",
+            params![task, new_sweep, now, total],
         )?;
         {
             let mut ins = tx.prepare(
@@ -294,7 +336,7 @@ impl Store {
             params![task, new_sweep],
         )?;
         tx.commit()?;
-        Ok((new_sweep, rows.len() as i64))
+        Ok((new_sweep, total))
     }
 
     fn mark_sweep_complete(&self, task: &str, sweep: i64, now: i64) -> Result<()> {
@@ -308,9 +350,7 @@ impl Store {
 
     fn sweep_complete_result(&self, task: &str, sweep: i64) -> Result<NextResult> {
         let (covered, total): (i64, i64) = self.conn.query_row(
-            "SELECT coalesce(sum(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0),
-                    count(*)
-             FROM work_items WHERE task_name = ?1 AND sweep = ?2",
+            "SELECT done, total FROM sweeps WHERE task_name = ?1 AND sweep = ?2",
             params![task, sweep],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -442,40 +482,57 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        tx.execute(
-            "UPDATE work_items
-                SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL
-              WHERE task_name = ?1 AND sweep = ?2 AND status = 'leased'
-                AND lease_expires_at < ?3",
-            params![task, sweep, now],
-        )?;
+        let reclaimed = tx
+            .prepare_cached(
+                "UPDATE work_items
+                    SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL
+                  WHERE task_name = ?1 AND sweep = ?2 AND status = 'leased'
+                    AND lease_expires_at < ?3",
+            )?
+            .execute(params![task, sweep, now])?;
+        if reclaimed > 0 {
+            tx.prepare_cached(
+                "UPDATE sweeps SET leased = leased - ?3, pending = pending + ?3
+                  WHERE task_name = ?1 AND sweep = ?2",
+            )?
+            .execute(params![task, sweep, reclaimed as i64])?;
+        }
 
         // Saturate rather than overflow-panic (debug) or wrap negative (release,
-        // which would make the lease look already expired).
+        // which would make the lease look already expired). `path ASC` is omitted
+        // from the ORDER BY: score already carries a path-seeded tie-break so the
+        // order is total, and dropping it lets the claim use idx_claim without a
+        // temp b-tree sort.
         let expires = now.checked_add(ttl).unwrap_or(i64::MAX);
         let claimed: Option<(String, f64, i64)> = tx
-            .query_row(
+            .prepare_cached(
                 "UPDATE work_items
                     SET status = 'leased', lease_owner = ?3, lease_expires_at = ?4
                   WHERE rowid = (
                       SELECT rowid FROM work_items
                        WHERE task_name = ?1 AND sweep = ?2 AND status = 'pending'
-                       ORDER BY score DESC, path ASC
+                       ORDER BY score DESC
                        LIMIT 1)
                 RETURNING path, score, lease_expires_at",
-                params![task, sweep, agent, expires],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+            )?
+            .query_row(params![task, sweep, agent, expires], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .optional()?;
 
         let outcome = match claimed {
             Some((path, score, expires)) => {
-                let remaining: i64 = tx.query_row(
-                    "SELECT count(*) FROM work_items
-                      WHERE task_name = ?1 AND sweep = ?2 AND status = 'pending'",
-                    params![task, sweep],
-                    |r| r.get(0),
-                )?;
+                // pending -> leased: O(1) counter update, then read remaining.
+                tx.prepare_cached(
+                    "UPDATE sweeps SET pending = pending - 1, leased = leased + 1
+                      WHERE task_name = ?1 AND sweep = ?2",
+                )?
+                .execute(params![task, sweep])?;
+                let remaining: i64 = tx
+                    .prepare_cached(
+                        "SELECT pending FROM sweeps WHERE task_name = ?1 AND sweep = ?2",
+                    )?
+                    .query_row(params![task, sweep], |r| r.get(0))?;
                 ClaimOutcome::Leased {
                     path,
                     score,
@@ -484,12 +541,11 @@ impl Store {
                 }
             }
             None => {
-                let leased: i64 = tx.query_row(
-                    "SELECT count(*) FROM work_items
-                      WHERE task_name = ?1 AND sweep = ?2 AND status = 'leased'",
-                    params![task, sweep],
-                    |r| r.get(0),
-                )?;
+                let leased: i64 = tx
+                    .prepare_cached(
+                        "SELECT leased FROM sweeps WHERE task_name = ?1 AND sweep = ?2",
+                    )?
+                    .query_row(params![task, sweep], |r| r.get(0))?;
                 if leased > 0 {
                     ClaimOutcome::NoneAvailable { leased }
                 } else {
@@ -559,28 +615,36 @@ impl Store {
         let result_status = if already_terminal {
             cur_status
         } else {
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE work_items
                     SET status = ?4, visited_at = ?5, lease_owner = NULL, lease_expires_at = NULL
                   WHERE task_name = ?1 AND sweep = ?2 AND path = ?3
                     AND status NOT IN ('done', 'skipped')",
-                params![task, sweep, path, st, now],
-            )?;
-            tx.execute(
+            )?
+            .execute(params![task, sweep, path, st, now])?;
+            tx.prepare_cached(
                 "INSERT INTO visits
                    (task_name, path, sweep, visited_at, agent_id, status, reason, outcome)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![task, path, sweep, now, agent, st, reason, found],
-            )?;
+            )?
+            .execute(params![task, path, sweep, now, agent, st, reason, found])?;
+            // Move the counter from the row's previous state (pending/leased) to
+            // its new terminal state (done/skipped). Both names come from a fixed
+            // internal set, never user input.
+            let from = cur_status.as_str(); // "pending" or "leased"
+            tx.prepare_cached(&format!(
+                "UPDATE sweeps SET {from} = {from} - 1, {st} = {st} + 1
+                  WHERE task_name = ?1 AND sweep = ?2"
+            ))?
+            .execute(params![task, sweep])?;
             st.to_string()
         };
 
-        let remaining: i64 = tx.query_row(
-            "SELECT count(*) FROM work_items
-              WHERE task_name = ?1 AND sweep = ?2 AND status IN ('pending', 'leased')",
-            params![task, sweep],
-            |r| r.get(0),
-        )?;
+        let remaining: i64 = tx
+            .prepare_cached(
+                "SELECT pending + leased FROM sweeps WHERE task_name = ?1 AND sweep = ?2",
+            )?
+            .query_row(params![task, sweep], |r| r.get(0))?;
         let sweep_complete = remaining == 0;
         if sweep_complete {
             tx.execute(
@@ -617,19 +681,14 @@ impl Store {
                 percent: 0.0,
             }),
             Some((sweep, st)) => {
-                let count = |status: &str| -> Result<i64> {
-                    Ok(self.conn.query_row(
-                        "SELECT count(*) FROM work_items
-                          WHERE task_name = ?1 AND sweep = ?2 AND status = ?3",
-                        params![task, sweep, status],
-                        |r| r.get(0),
-                    )?)
-                };
-                let done = count("done")?;
-                let leased = count("leased")?;
-                let pending = count("pending")?;
-                let skipped = count("skipped")?;
-                let total = done + leased + pending + skipped;
+                // O(1): read the maintained counters off the sweep row.
+                let (total, done, leased, pending, skipped): (i64, i64, i64, i64, i64) =
+                    self.conn.query_row(
+                        "SELECT total, done, leased, pending, skipped
+                           FROM sweeps WHERE task_name = ?1 AND sweep = ?2",
+                        params![task, sweep],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                    )?;
                 let percent = if total > 0 {
                     100.0 * done as f64 / total as f64
                 } else {
@@ -699,16 +758,14 @@ impl Store {
                 completed_at: None,
             }),
             Some((sweep, st)) => {
-                let total: i64 = self.conn.query_row(
-                    "SELECT count(*) FROM work_items WHERE task_name = ?1 AND sweep = ?2",
-                    params![task, sweep],
-                    |r| r.get(0),
-                )?;
-                let (started, completed): (Option<i64>, Option<i64>) = self.conn.query_row(
-                    "SELECT started_at, completed_at FROM sweeps WHERE task_name = ?1 AND sweep = ?2",
-                    params![task, sweep],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
+                // One O(1) read off the sweep row (total is the maintained counter).
+                let (total, started, completed): (i64, Option<i64>, Option<i64>) =
+                    self.conn.query_row(
+                        "SELECT total, started_at, completed_at
+                           FROM sweeps WHERE task_name = ?1 AND sweep = ?2",
+                        params![task, sweep],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )?;
                 Ok(SweepInfo {
                     task: task.to_string(),
                     sweep,
@@ -765,12 +822,33 @@ impl Store {
             let tx = self
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Per-sweep counts of about-to-be-reclaimed leases, so we can move
+            // the counters with a scoped delta instead of recomputing the whole
+            // (never-pruned) board.
+            let deltas: Vec<(String, i64, i64)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT task_name, sweep, count(*) FROM work_items
+                      WHERE status = 'leased' AND lease_expires_at < ?1
+                      GROUP BY task_name, sweep",
+                )?;
+                let rows = stmt
+                    .query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
             let n = tx.execute(
                 "UPDATE work_items
                     SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL
                   WHERE status = 'leased' AND lease_expires_at < ?1",
                 params![now],
             )?;
+            for (t, sweep, k) in &deltas {
+                tx.execute(
+                    "UPDATE sweeps SET leased = leased - ?3, pending = pending + ?3
+                      WHERE task_name = ?1 AND sweep = ?2",
+                    params![t, sweep, k],
+                )?;
+            }
             tx.commit()?;
             n as i64
         };
@@ -838,6 +916,55 @@ impl Store {
                 |r| r.get(0),
             )
             .unwrap()
+    }
+
+    /// Assert the maintained sweep counters match the actual work_items board.
+    fn assert_counters_consistent(&self, task: &str) {
+        let sweeps: Vec<(i64, i64, i64, i64, i64, i64)> = self
+            .conn
+            .prepare(
+                "SELECT sweep, total, pending, leased, done, skipped
+                   FROM sweeps WHERE task_name = ?1",
+            )
+            .unwrap()
+            .query_map(params![task], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect();
+        for (sweep, total, pending, leased, done, skipped) in sweeps {
+            let actual = |st: &str| -> i64 {
+                self.conn
+                    .query_row(
+                        "SELECT count(*) FROM work_items
+                          WHERE task_name = ?1 AND sweep = ?2 AND status = ?3",
+                        params![task, sweep, st],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            let act_total: i64 = self
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM work_items WHERE task_name = ?1 AND sweep = ?2",
+                    params![task, sweep],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(total, act_total, "sweep {sweep}: total counter drift");
+            assert_eq!(pending, actual("pending"), "sweep {sweep}: pending drift");
+            assert_eq!(leased, actual("leased"), "sweep {sweep}: leased drift");
+            assert_eq!(done, actual("done"), "sweep {sweep}: done drift");
+            assert_eq!(skipped, actual("skipped"), "sweep {sweep}: skipped drift");
+        }
     }
 }
 
@@ -1513,6 +1640,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sweep_counters_stay_consistent_through_transitions() {
+        let (mut s, mut cfg) = seeded(6);
+        cfg.lease.ttl_secs = 10;
+        // done + skipped transitions.
+        let p1 = claim_path(&mut s, &cfg, "a", NOW);
+        s.assert_counters_consistent("t");
+        s.complete("t", &p1, Some("a"), WorkStatus::Done, None, Some(3), NOW)
+            .unwrap();
+        let p2 = claim_path(&mut s, &cfg, "a", NOW);
+        s.complete("t", &p2, Some("a"), WorkStatus::Skipped, None, None, NOW)
+            .unwrap();
+        s.assert_counters_consistent("t");
+        // Leave a lease, let it expire, reclaim it via next().
+        claim_path(&mut s, &cfg, "a", NOW);
+        claim_path(&mut s, &cfg, "b", NOW + 100); // reclaims the expired one
+        s.assert_counters_consistent("t");
+        // gc reclaim path.
+        claim_path(&mut s, &cfg, "c", NOW + 200);
+        s.gc(NOW + 1000, false).unwrap();
+        s.assert_counters_consistent("t");
+        // Drain the rest, counters still consistent.
+        drain(&mut s, "t", WorkStatus::Done, NOW + 2000);
+        s.assert_counters_consistent("t");
+        let st = s.status("t").unwrap();
+        assert_eq!(st.pending, 0);
+        assert_eq!(st.leased, 0);
+        assert_eq!(st.done + st.skipped, 6);
+    }
+
+    fn claim_path(s: &mut Store, cfg: &Config, agent: &str, now: i64) -> String {
+        match s.next("t", cfg, Some(agent), None, false, now).unwrap() {
+            NextResult::Ok { path, .. } => path,
+            other => panic!("expected ok, got {other:?}"),
+        }
+    }
+
     proptest::proptest! {
         #[test]
         fn draining_a_sweep_covers_every_folder_exactly_once(n in 1usize..40) {
@@ -1535,6 +1699,7 @@ mod tests {
                 }
             }
             proptest::prop_assert_eq!(seen.len(), n);
+            s.assert_counters_consistent("t");
         }
     }
 }
