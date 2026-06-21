@@ -19,6 +19,21 @@ function bin() {
   return process.env.TRAIL_BIN || "trail";
 }
 
+function errorMessage(data, stderr, code) {
+  if (data && data.error) return data.error;
+  const err = (stderr || "").trim();
+  if (!err) return `trail exited ${code}`;
+  const lines = err.split("\n");
+  try {
+    // trail prints a JSON error to stderr on exit 1.
+    const parsed = JSON.parse(lines[lines.length - 1]);
+    if (parsed && parsed.error) return parsed.error;
+  } catch {
+    // not JSON (e.g. a clap usage error)
+  }
+  return lines[0].trim();
+}
+
 function run(args, root) {
   const argv = [];
   if (root) argv.push("--root", root);
@@ -35,8 +50,10 @@ function run(args, root) {
     }
   }
   const code = res.status ?? EXIT_ERROR;
-  if (code === EXIT_ERROR) {
-    throw new TrailError(data.error || (res.stderr || "").trim() || "trail error");
+  // Any code outside {0 ok, 3 sweep-complete, 4 none-available} is an error -
+  // including exit 2 (clap usage) - so every method surfaces it, not just claim.
+  if (code !== EXIT_OK && code !== EXIT_SWEEP_COMPLETE && code !== EXIT_NONE_AVAILABLE) {
+    throw new TrailError(errorMessage(data, res.stderr, code));
   }
   return { code, data };
 }

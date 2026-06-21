@@ -39,6 +39,21 @@ def _bin() -> str:
     return os.environ.get("TRAIL_BIN", "trail")
 
 
+def _error_message(data: Any, stderr: str, code: int) -> str:
+    if isinstance(data, dict) and data.get("error"):
+        return data["error"]
+    err = (stderr or "").strip()
+    if not err:
+        return f"trail exited {code}"
+    try:  # trail prints a JSON error to stderr on exit 1
+        parsed = json.loads(err.splitlines()[-1])
+        if isinstance(parsed, dict) and parsed.get("error"):
+            return parsed["error"]
+    except json.JSONDecodeError:
+        pass
+    return err.splitlines()[0].strip()  # e.g. clap's "error: ..." line
+
+
 def _run(args: list[str], root: Optional[str]) -> tuple[int, Any]:
     cmd = [_bin()]
     if root:
@@ -52,9 +67,10 @@ def _run(args: list[str], root: Optional[str]) -> tuple[int, Any]:
             data = json.loads(out.splitlines()[-1])
         except json.JSONDecodeError:
             data = {}
-    if proc.returncode == EXIT_ERROR:
-        msg = (isinstance(data, dict) and data.get("error")) or proc.stderr.strip() or "trail error"
-        raise TrailError(msg)
+    # Any code outside the expected set (0 ok, 3 sweep-complete, 4 none-available)
+    # is an error - including exit 2 (clap usage) - so every method surfaces it.
+    if proc.returncode not in (EXIT_OK, EXIT_SWEEP_COMPLETE, EXIT_NONE_AVAILABLE):
+        raise TrailError(_error_message(data, proc.stderr, proc.returncode))
     return proc.returncode, data
 
 

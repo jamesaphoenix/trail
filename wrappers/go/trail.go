@@ -73,25 +73,40 @@ func (c *Client) run(args ...string) (int, []byte, []byte, error) {
 	}
 	out := bytes.TrimSpace(stdout.Bytes())
 	// Any code outside the expected set (0 ok, 3 sweep-complete, 4 none-available)
-	// is an error - notably exit 2 (clap usage). Surface stderr rather than
-	// letting a non-claim caller hit "unexpected end of JSON input" on empty out.
+	// is an error - notably exit 2 (clap usage). Surface a useful message rather
+	// than letting a non-claim caller hit "unexpected end of JSON input".
 	if code != ExitOK && code != ExitSweepComplete && code != ExitNoneAvailable {
-		msg := lastLine(stderr.String())
-		if msg == "" {
-			msg = fmt.Sprintf("trail exited %d", code)
-		}
-		return code, out, stderr.Bytes(), fmt.Errorf("trail: %s", msg)
+		return code, out, stderr.Bytes(), fmt.Errorf("trail: %s", errorMessage(out, stderr.Bytes(), code))
 	}
 	return code, out, stderr.Bytes(), nil
 }
 
-func lastLine(s string) string {
-	s = strings.TrimSpace(s)
+// errorMessage prefers a JSON `error` field (trail's exit-1 error is JSON on
+// stderr), else the first stderr line (clap usage errors put "error: ..."
+// first), else a generic code.
+func errorMessage(stdout, stderr []byte, code int) string {
+	if m := jsonError(stdout); m != "" {
+		return m
+	}
+	s := strings.TrimSpace(string(stderr))
 	if s == "" {
-		return ""
+		return fmt.Sprintf("trail exited %d", code)
 	}
 	lines := strings.Split(s, "\n")
-	return lines[len(lines)-1]
+	if m := jsonError([]byte(lines[len(lines)-1])); m != "" {
+		return m
+	}
+	return strings.TrimSpace(lines[0])
+}
+
+func jsonError(b []byte) string {
+	var v struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(bytes.TrimSpace(b), &v) == nil {
+		return v.Error
+	}
+	return ""
 }
 
 func (c *Client) outcomeArgs(found *int, clean bool) []string {
