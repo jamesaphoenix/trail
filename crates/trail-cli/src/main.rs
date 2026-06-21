@@ -63,8 +63,8 @@ enum Cmd {
         agent: Option<String>,
         /// Findings reported for this folder. With strategy.outcome_weight > 0,
         /// higher counts pull this folder up in future sweeps.
-        /// Findings count (non-negative); clap rejects negatives.
-        #[arg(long, conflicts_with = "clean")]
+        /// Findings count (0..=i64::MAX); clap rejects negatives and overflow.
+        #[arg(long, conflicts_with = "clean", value_parser = clap::value_parser!(u64).range(0..=i64::MAX as u64))]
         found: Option<u64>,
         /// Shorthand for --found 0 (folder was clean).
         #[arg(long)]
@@ -80,8 +80,8 @@ enum Cmd {
         agent: Option<String>,
         #[arg(long)]
         reason: Option<String>,
-        /// Findings count (non-negative); clap rejects negatives.
-        #[arg(long, conflicts_with = "clean")]
+        /// Findings count (0..=i64::MAX); clap rejects negatives and overflow.
+        #[arg(long, conflicts_with = "clean", value_parser = clap::value_parser!(u64).range(0..=i64::MAX as u64))]
         found: Option<u64>,
         #[arg(long)]
         clean: bool,

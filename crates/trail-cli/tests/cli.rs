@@ -254,6 +254,19 @@ fn empty_task_and_negative_found_are_rejected() {
         .args(["done", "--task", "t", "--path", "a", "--found=-5"])
         .assert()
         .failure();
+    // A value above i64::MAX is also rejected (so the u64 -> i64 cast can't wrap).
+    trail(root)
+        .args([
+            "done",
+            "--task",
+            "t",
+            "--path",
+            "a",
+            "--found",
+            "18446744073709551615",
+        ])
+        .assert()
+        .failure();
 }
 
 #[test]
