@@ -1,0 +1,23 @@
+[package]
+name = "trail-py"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Native Python bindings (pyo3) for the trail coverage scheduler."
+
+[lib]
+# Importable as `import trail`. cdylib so it loads as a Python extension module.
+name = "trail"
+crate-type = ["cdylib"]
+
+[dependencies]
+trail-core = { path = "../../crates/trail-core" }
+serde = "1"
+serde_json = "1"
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+pythonize = "0.23"
+
+# Standalone workspace so the audited main workspace / CI is unaffected by the
+# extension-module link settings.
+[workspace]

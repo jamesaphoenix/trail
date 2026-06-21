@@ -1,0 +1,21 @@
+{
+  "name": "trail-node",
+  "version": "0.1.0",
+  "description": "Native Node.js bindings for the trail coverage scheduler.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "napi": {
+    "name": "trail-node"
+  },
+  "scripts": {
+    "build": "napi build --release",
+    "build:debug": "napi build"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

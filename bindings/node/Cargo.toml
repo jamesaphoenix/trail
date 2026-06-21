@@ -1,0 +1,23 @@
+[package]
+name = "trail-node"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Native Node.js bindings (napi-rs) for the trail coverage scheduler."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+trail-core = { path = "../../crates/trail-core" }
+serde = "1"
+serde_json = "1"
+napi = { version = "2", features = ["napi8", "serde-json"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"
+
+# Standalone workspace so the audited main workspace / CI is unaffected.
+[workspace]

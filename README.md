@@ -85,20 +85,28 @@ Commit `.trail.toml`; gitignore `.trail/` (the state DB). `.gitignore`/`.ignore`
 and hidden dirs are excluded for free; config only layers extra globs. See
 [`.trail.toml.example`](.trail.toml.example).
 
-## Wrappers
+## Wrappers and bindings
+
+Thin wrappers (shell out to the binary, parse JSON):
 
 - Python: [`wrappers/python`](wrappers/python)
 - TypeScript / Node: [`wrappers/typescript`](wrappers/typescript)
 
-Both are thin wrappers that shell out to the binary and parse JSON. The
-shell-out + JSON + exit-code contract makes a wrapper in any language trivial.
+Native, in-process bindings (no subprocess; same shapes as the CLI):
+
+- Python via pyo3: [`bindings/python`](bindings/python)
+- Node via napi-rs: [`bindings/node`](bindings/node)
+
+The shell-out + JSON + exit-code contract makes a thin wrapper in any language
+trivial; the native bindings run the scheduler directly for hot loops.
 
 ## Layout
 
 ```
 crates/trail-core   library: walk, scoring, SQLite store + atomic claim/lease
 crates/trail-cli    the `trail` binary
-wrappers/           thin Python + TypeScript wrappers
+wrappers/           thin Python + TypeScript wrappers (shell out)
+bindings/           native in-process bindings (pyo3 Python, napi-rs Node)
 skills/trail        SKILL.md for agents
 ```
 

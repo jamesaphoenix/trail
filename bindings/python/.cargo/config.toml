@@ -1,0 +1,8 @@
+# macOS must resolve undefined Python symbols at import time, not link time.
+# maturin sets this automatically; this also lets a plain `cargo build` link the
+# extension module for local verification. (Linux/Windows allow it by default.)
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

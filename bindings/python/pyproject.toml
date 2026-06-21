@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "trail"
+version = "0.1.0"
+description = "Native Python bindings for the trail coverage scheduler"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+# abi3 wheel: one build works across CPython >= 3.9.
+features = ["pyo3/abi3-py39"]
